@@ -1,0 +1,26 @@
+# Python and virtual environments
+*.py[cod]
+*$py.class
+__pycache__/
+venv/
+.venv/
+env/
+.env
+
+# OS-specific files
+.DS_Store
+
+# IDE settings
+.vscode/
+.idea/
+
+# Project-specific state & configuration
+config.json
+config-*.json
+status.json
+*.log
+scripts/
+wifi.txt
+*.mpy
+!app.mpy
+min/

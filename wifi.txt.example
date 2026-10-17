@@ -1,0 +1,5 @@
+# Copy this file to wifi.txt on the Pico. main.py parses it directly.
+# One "KEY = value" per line; quotes on the value are optional.
+# Do not commit your real wifi.txt (it holds your WiFi password).
+SSID = YourNetwork
+PASSWORD = YourPassword
