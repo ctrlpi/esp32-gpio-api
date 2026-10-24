@@ -26,12 +26,15 @@ except ImportError:
 FALLBACK_SSID     = "MyNetwork"
 FALLBACK_PASSWORD = "MyPassword"
 DEFAULT_API_KEY   = "your-secret-key"
-VERSION           = "0.9.26"  # API version
+VERSION           = "0.9.27"  # API version
 DEFAULT_LOG_DAYS  = 7
 PORT              = 8314
 WIFI_DEAD_SECS    = 40    # dead-man switch: reset if WiFi stays lost this long
 WIFI_PROBE_SECS   = 120   # idle this long: probe the gateway, then this often
 WIFI_RECONNECT_SECS = 20  # a soft reconnect gets this long before the board resets
+HEAP_LOW_BYTES    = 6144  # heap dead-man: largest free system-RAM block below this...
+HEAP_LOW_SECS     = 30    # ...for this long (no pulse pending) flushes and resets
+HEAP_CHECK_SECS   = 5     # how often the main loop looks
 WEBHOOK_MIN_MS    = 200   # watch debounce
 WEBHOOK_IDLE_MS   = 90000 # socket idle timeout
 WEBHOOK_RETRIES   = 2     # extra attempts
@@ -108,9 +111,16 @@ LED_PIN, LED_ACTIVE_LOW, LED_RGB = _detect_default_led()
 LED_RGB_COLOR           = (0, 40, 0)  # dim green; a WS2812 at full power is blinding
 LED_TIMER_ID            = 0
 
-# An https webhook needs the ssl module; a build without it refuses https URLs.
-HTTPS_WEBHOOK_OK    = _HAS_SSL
-HTTPS_WEBHOOK_ERROR = "https webhook URLs require an SSL-enabled MicroPython build"
+# An https webhook needs the ssl module, and a TLS handshake needs roughly 35 KB of
+# contiguous system RAM. A classic ESP32 has about 24 KB free after boot (largest block
+# ~19 KB), so every https POST fails with ENOMEM: like the original Pico W, it refuses
+# https URLs instead of storing one that never delivers. The S3 and C3 have the room.
+_IS_CLASSIC         = "s3" not in _CHIP and "c3" not in _CHIP
+HTTPS_WEBHOOK_OK    = _HAS_SSL and not _IS_CLASSIC
+HTTPS_WEBHOOK_ERROR = ("https webhook URLs are not supported on a classic ESP32: TLS needs more "
+                       "memory than it has free. Use an http:// URL, or an ESP32-S3 or C3."
+                       if _IS_CLASSIC else
+                       "https webhook URLs require an SSL-enabled MicroPython build")
 
 def _is_https(url):
 	return str(url or "").strip().lower().startswith("https://")
@@ -1486,40 +1496,54 @@ class WifiWatchdog:
 			self._reconnect_at = now
 			self._reconnect(self._wlan)
 
-# HTTP
-
-# Reads and discards the rest of a refused request (up to budget bytes, for at most
-# max_ms) so the client can read the error reply.
-def _drain(conn, data, budget=64 * 1024, quiet_ms=1000, max_ms=3000):
-	remaining = -1
-	sep = data.find(b"\r\n\r\n")
-	if sep != -1:
-		for line in data[:sep].decode("utf-8", "replace").split("\r\n")[1:]:
-			if line.lower().startswith("content-length:"):
-				try:
-					remaining = int(line.split(":", 1)[1].strip()) - (len(data) - sep - 4)
-				except Exception:
-					remaining = -1
-				break
-	if remaining == 0:
-		return
-
-	conn.settimeout(quiet_ms / 1000)
-	hard = utime.ticks_add(utime.ticks_ms(), max_ms)
+# The largest free block of system (ESP-IDF) RAM, or None where that cannot be read.
+def _largest_free_block():
 	try:
-		while budget > 0 and remaining != 0 and utime.ticks_diff(hard, utime.ticks_ms()) > 0:
-			try:
-				chunk = conn.recv(1024)
-			except Exception:
-				return
-			if not chunk:
-				return
-			budget -= len(chunk)
-			if remaining > 0:
-				remaining = max(0, remaining - len(chunk))
-	finally:
-		try: conn.settimeout(2)
-		except Exception: pass
+		import esp32
+		return max(r[2] for r in esp32.idf_heap_info(esp32.HEAP_DATA))
+	except Exception:
+		return None
+
+class HeapWatch:
+	"""Heap dead-man. lwIP and the Wi-Fi driver allocate from system RAM, and a classic ESP32
+	that has run short of it stays half alive: it accepts connections but cannot send a
+	reply, and nothing else resets it. Every HEAP_CHECK_SECS this reads the largest free
+	block; below HEAP_LOW_BYTES for HEAP_LOW_SECS, with no pulse pending, it flushes and
+	resets so the board comes back clean."""
+
+	def __init__(self, manager, largest=_largest_free_block, reset=None, now=utime.time):
+		self._manager, self._largest, self._now = manager, largest, now
+		self._reset = reset or self._hard_reset
+		self._checked = now()
+		self._low_since = None
+
+	def _log(self, msg):
+		self._manager.log("[HEAP] " + msg)
+		print("[HEAP] " + msg)
+
+	def _hard_reset(self):
+		self._manager._flush_all()
+		machine.reset()
+
+	def tick(self, busy=False):
+		now = self._now()
+		if now - self._checked < HEAP_CHECK_SECS:
+			return
+		self._checked = now
+		largest = self._largest()
+		if largest is None or largest >= HEAP_LOW_BYTES:
+			if largest is not None and self._low_since is not None:
+				self._log("recovered (largest free block %d bytes)" % largest)
+			self._low_since = None
+			return
+		if self._low_since is None:
+			self._low_since = now
+			self._log("largest free block %d bytes, under %d" % (largest, HEAP_LOW_BYTES))
+		elif now - self._low_since >= HEAP_LOW_SECS and not busy:
+			self._log("still low after %ds, resetting" % (now - self._low_since))
+			self._reset()
+
+# HTTP
 
 # Reads one request within 6 s. Returns (headers, body), or None when it is too
 # big, chunked, cut off or late, which the caller answers 400.
@@ -1543,7 +1567,6 @@ def _recv_request(conn):
 		if body is None:
 			data += chunk
 			if len(data) > MAX_REQUEST_BYTES:
-				_drain(conn, data)
 				return None
 			sep = data.find(b"\r\n\r\n")
 			if sep == -1:
@@ -1560,8 +1583,11 @@ def _recv_request(conn):
 			# A chunked body has no Content-Length, so cl stays 0 and the request would be
 			# returned with its body unread - an empty body that /config/load applies as {}.
 			# No real client sends one here; refuse it (400) instead of decoding it.
+			# Refused requests are not read to the end: the 400 goes out and the socket is
+			# closed with the rest unread. Draining up to 64 KB just to discard it filled
+			# lwIP's buffers and took a classic ESP32 off the network (api-tester test 54).
+			# The Pi answers 413 after reading; a client may see a reset instead here.
 			if chunked or cl > MAX_REQUEST_BYTES:
-				_drain(conn, data)
 				return None
 			if cl == 0:
 				# No Content-Length: whatever followed the headers is the body.
@@ -1641,18 +1667,56 @@ def _send_empty(conn, status=404):
 	except Exception:
 		pass
 
+# Yields the JSON text of obj in small pieces that join to exactly ujson.dumps(obj).
+# The top two levels (the reply object and its lists/maps, e.g. scan's gpios) are split;
+# anything deeper is one piece.
+def _json_pieces(obj, depth=2):
+	if depth and isinstance(obj, dict):
+		yield "{"
+		first = True
+		for k, v in obj.items():
+			yield ("" if first else ", ") + ujson.dumps(k) + ": "
+			first = False
+			yield from _json_pieces(v, depth - 1)
+		yield "}"
+	elif depth and isinstance(obj, list):
+		yield "["
+		for i, v in enumerate(obj):
+			if i:
+				yield ", "
+			yield from _json_pieces(v, depth - 1)
+		yield "]"
+	else:
+		yield ujson.dumps(obj)
+
 # Sends a JSON response. Every response closes the connection (no keep-alive).
+# The body is never built as one string: it is sized from its pieces first, then sent
+# in writes of about SEND_CHUNK bytes. A /gpio/scan reply (~2 KB) built whole, plus its
+# bytes copy, was the allocation that a classic ESP32 short of system RAM could not
+# send (api-tester test 17).
+SEND_CHUNK = 512
+
 def _send_json(conn, data, status=200):
-	body = ujson.dumps(data).encode()
-	header = (
+	size = 0
+	for piece in _json_pieces(data):
+		size += len(piece.encode())
+	out = [(
 		f"HTTP/1.1 {status} {_STATUS_TEXT.get(status, 'Error')}\r\n"
 		f"Content-Type: application/json\r\n"
-		f"Content-Length: {len(body)}\r\n"
+		f"Content-Length: {size}\r\n"
 		f"Connection: close\r\n\r\n"
-	).encode()
+	).encode()]
+	n = len(out[0])
 	try:
-		_send_all(conn, header)
-		_send_all(conn, body)
+		for piece in _json_pieces(data):
+			b = piece.encode()
+			out.append(b)
+			n += len(b)
+			if n >= SEND_CHUNK:
+				_send_all(conn, b"".join(out))
+				out, n = [], 0
+		if out:
+			_send_all(conn, b"".join(out))
 	except Exception:
 		pass
 
@@ -1991,6 +2055,7 @@ def main():
 	wlan         = network.WLAN(network.STA_IF)
 	wifi_last_ok = utime.time()
 	watchdog     = WifiWatchdog(wlan, manager)
+	heap_watch   = HeapWatch(manager)
 	boot_blink   = True
 
 	while True:
@@ -2013,6 +2078,7 @@ def main():
 				manager._flush_all()
 				machine.reset()
 			watchdog.tick(busy=bool(manager._pending_reverts))
+			heap_watch.tick(busy=bool(manager._pending_reverts))
 			conn, _ = server.accept()
 			watchdog.traffic()
 			handle_request(conn, manager)

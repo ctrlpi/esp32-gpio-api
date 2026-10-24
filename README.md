@@ -1,7 +1,7 @@
 # ESP32 GPIO API
 
 [![Platform: ESP32](https://img.shields.io/badge/platform-ESP32-E7352C.svg)](#install-on-your-esp32)
-[![Version 0.9.26](https://img.shields.io/badge/version-0.9.26-blue.svg)](https://github.com/ctrlpi/esp32-gpio-api/tags)
+[![Version 0.9.27](https://img.shields.io/badge/version-0.9.27-blue.svg)](https://github.com/ctrlpi/esp32-gpio-api/tags)
 [![MicroPython 1.29](https://img.shields.io/badge/runtime-MicroPython%201.29-blue.svg)](#install-on-your-esp32)
 [![Auth: Api-Key](https://img.shields.io/badge/auth-Api--Key-orange.svg)](#authentication)
 [![License: MIT](https://img.shields.io/badge/license-MIT-188038.svg)](LICENSE)
@@ -372,9 +372,17 @@ For reversed pins the payload also includes `level` (the physical GPIO state).
 
 No webhook URL is configured by default. When a watched event occurs with **no target at all** configured (no `webhook_url` and no bridge callback), nothing is sent; the event is recorded in the agent log instead.
 
-### HTTPS targets
+### Https targets: ESP32 vs ESP32-S3 / C3
 
-HTTPS webhooks work when the installed MicroPython firmware includes SSL support. TLS needs substantially more memory than plain HTTP, so keep local bridge callbacks on HTTP where possible.
+A TLS handshake needs roughly 35-40 KB of *contiguous* heap. A classic ESP32 has only about 24 KB of system memory free after boot, with no block over about 19 KB, so an https webhook on a classic ESP32 fails on every attempt with an out-of-memory error, in a way no amount of garbage collection fixes.
+
+As a result, **on the classic ESP32, `webhook_url` must be `http://`. An `https://` URL is rejected with a `400`, and is not stored.**
+
+The **ESP32-S3** has the memory headroom and is unaffected: `https://` works there. The **ESP32-C3** is marginal: `https://` is accepted and usually delivers, but a handshake can still run out of memory and that delivery waits for its retry, so `http://` is recommended but not mandatory.
+
+This applies to `webhook_url` only. The `bridges.homekit` / `bridges.matter` / `bridges.homebridge` callbacks are LAN targets that are already plain http, and plain http is unaffected on every chip.
+
+For the same reason, a remote `POST /upgrade` on a classic ESP32 may fail at the TLS handshake, since it downloads `app.mpy`, `boot.py` and `main.py` over https. Retry, or install over USB with `install.sh` (or copy the files with `mpremote`).
 
 ### Delivery and retries
 
@@ -434,11 +442,11 @@ It carries no pin fields; consumers of the webhook feed should treat entries wit
 
 ### Authentication
 
-If a dedicated `webhook_key` is configured, it is sent as the `Api-Key` header on every webhook POST; if not, no `Api-Key` header is sent at all. The agent's own `api_key` is never sent to the webhook target. The public `https://ctrlpi.com/webhook/test` test endpoint requires no key, it will display whatever key was sent for debugging.
+If a dedicated `webhook_key` is configured, it is sent as the `Api-Key` header on every webhook POST; if not, no `Api-Key` header is sent at all. The agent's own `api_key` is never sent to the webhook target. The public `https://hooks.ctrlpi.com/webhook/test` test endpoint requires no key, it will display whatever key was sent for debugging.
 
 ### Testing webhooks
 
-For development and testing, point `webhook_url` at `https://ctrlpi.com/webhook/test` and monitor [https://ctrlpi.com/webhook/watch](https://ctrlpi.com/webhook/watch). The feed is public and events are retained briefly.
+For development and testing, ctrlPi provides a public test endpoint: point `webhook_url` at `https://hooks.ctrlpi.com/webhook/test` and monitor the incoming events live at [https://ctrlpi.com/webhook/watch](https://ctrlpi.com/webhook/watch). The feed is public and events are retained only briefly, so use it for verification during setup, not as a production target. (On a classic ESP32 this target is unreachable - see [https targets](#https-targets-esp32-vs-esp32-s3--c3) above.)
 
 ### Changing the URL
 
@@ -476,7 +484,7 @@ The repository contains source, build, deployment, and device runtime files.
 | Sensor scripts | `.sh`, run as `sh scripts/<file>` | `.py`, exec'd in-process |
 | Interactive API docs (`/docs`, `/redoc`) | Yes (`settings.docs_enabled`) | No |
 | Logs | File (`agent.log`), last 50 lines via `/logs` | In-memory ring buffer, last 30 lines via `/logs`, cleared on reboot |
-| HTTPS webhook targets | Always available | Available with SSL-enabled firmware |
+| https webhook targets | Always available | ESP32-S3 and C3 only (see [https targets](#https-targets-esp32-vs-esp32-s3--c3)) |
 
 ## Tests
 

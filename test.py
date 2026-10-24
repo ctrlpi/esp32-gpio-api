@@ -207,6 +207,23 @@ class TestEsp32GpioApi(unittest.TestCase):
         self.post("/sensor/config/numeric", headers=self.headers, json={"remove": True})
         self.post("/gpio/config/26", headers=self.headers, json={"type": "remove"})
 
+    def test_https_webhook_refused_on_classic(self):
+        """A classic ESP32 (the mocked chip) refuses an https webhook URL, like the Pico W"""
+        res = self.post("/config/update", headers=self.headers, json={"webhook_url": "https://example.com/hook"})
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("classic ESP32", res.json().get("error", ""))
+        cfg = self.get("/config/read", headers=self.headers).json()
+        self.assertNotEqual(cfg["notifications"].get("webhook"), "https://example.com/hook")
+        # Plain http is accepted.
+        res = self.post("/config/update", headers=self.headers, json={"webhook_url": "http://example.com/hook"})
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["notifications"]["webhook"], "http://example.com/hook")
+        # /config/load drops an https URL instead of storing it.
+        res = self.post("/config/load", headers=self.headers, json={"notifications": {"webhook": "https://example.com/hook"}})
+        self.assertEqual(res.status_code, 200)
+        self.assertFalse(res.json()["notifications"].get("webhook"))
+        self.post("/config/update", headers=self.headers, json={"webhook_url": ""})
+
     def test_config_load(self):
         """POST /config/load loads bulk JSON configuration"""
         payload = {
@@ -312,6 +329,23 @@ class TestEsp32GpioApi(unittest.TestCase):
         data = r.json()
         self.assertIn("gpios", data)
         self.assertIsInstance(data["gpios"], list)
+
+    def test_big_replies_exact_length(self):
+        """Replies sent in pieces still carry an exact Content-Length and parse as JSON"""
+        for path in ("/gpio/scan", "/config/read", "/logs", "/gpio/read"):
+            with socket.create_connection(("127.0.0.1", self.port), timeout=5) as s:
+                s.sendall(f"GET {path} HTTP/1.1\r\nHost: x\r\nApi-Key: {self.api_key}\r\n\r\n".encode())
+                raw = b""
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    raw += chunk
+            head, _, body = raw.partition(b"\r\n\r\n")
+            length = next(int(l.split(b":", 1)[1]) for l in head.split(b"\r\n")
+                          if l.lower().startswith(b"content-length:"))
+            self.assertEqual(length, len(body), path)
+            json.loads(body)
 
     def test_status_led_not_reconfigured(self):
         """Scan and read report the status LED pin (GPIO2 here) as the blinker's output, not as a re-created input"""
@@ -520,6 +554,99 @@ class TestWifiWatchdog(unittest.TestCase):
         self.dog.traffic()
         self.idle(self.reconnect_secs + 5)
         self.assertEqual(self.resets, 0)
+
+
+
+class TestHeapWatch(unittest.TestCase):
+    """HeapWatch on a fake clock and a fake largest-free-block reader."""
+
+    @classmethod
+    def setUpClass(cls):
+        repo_dir = os.path.dirname(os.path.abspath(__file__))
+        sys.path[:0] = [os.path.join(repo_dir, "test_mocks"), repo_dir]
+        # app.py starts the server on its last line; load everything above it.
+        with open(os.path.join(repo_dir, "app.py")) as f:
+            src = f.read().replace("\nmain()\n", "\n")
+        cls.app = {"__name__": "app_under_test"}
+        exec(compile(src, "app.py", "exec"), cls.app)
+
+    def setUp(self):
+        self.t = 1000
+        self.largest = 20000
+        self.resets = 0
+        manager = type("Manager", (), {"log": lambda s, m: None, "_flush_all": lambda s: None})()
+
+        def reset():
+            self.resets += 1
+
+        self.watch = self.app["HeapWatch"](manager, largest=lambda: self.largest,
+                                           reset=reset, now=lambda: self.t)
+        self.low = self.app["HEAP_LOW_BYTES"]
+        self.low_secs = self.app["HEAP_LOW_SECS"]
+
+    def run_for(self, seconds, busy=False):
+        for _ in range(seconds):
+            self.t += 1
+            self.watch.tick(busy=busy)
+
+    def test_healthy_heap_never_resets(self):
+        self.run_for(10 * self.low_secs)
+        self.assertEqual(self.resets, 0)
+
+    def test_low_heap_resets_after_the_grace_period(self):
+        self.largest = self.low - 1
+        self.run_for(self.low_secs - 10)
+        self.assertEqual(self.resets, 0)
+        self.run_for(20)
+        self.assertGreaterEqual(self.resets, 1)
+
+    def test_a_short_dip_does_not_reset(self):
+        self.largest = self.low - 1
+        self.run_for(self.low_secs // 2)
+        self.largest = self.low + 1000
+        self.run_for(10)
+        self.largest = self.low - 1
+        self.run_for(self.low_secs // 2)
+        self.assertEqual(self.resets, 0)
+
+    def test_no_reset_while_a_pulse_is_pending(self):
+        self.largest = self.low - 1
+        self.run_for(3 * self.low_secs, busy=True)
+        self.assertEqual(self.resets, 0)
+        self.run_for(10)
+        self.assertGreaterEqual(self.resets, 1)
+
+    def test_unreadable_heap_never_resets(self):
+        self.largest = None
+        self.run_for(10 * self.low_secs)
+        self.assertEqual(self.resets, 0)
+
+
+class TestJsonPieces(unittest.TestCase):
+    """_json_pieces joins to exactly what ujson.dumps gives for the same object."""
+
+    @classmethod
+    def setUpClass(cls):
+        repo_dir = os.path.dirname(os.path.abspath(__file__))
+        sys.path[:0] = [os.path.join(repo_dir, "test_mocks"), repo_dir]
+        with open(os.path.join(repo_dir, "app.py")) as f:
+            src = f.read().replace("\nmain()\n", "\n")
+        cls.app = {"__name__": "app_under_test"}
+        exec(compile(src, "app.py", "exec"), cls.app)
+
+    def test_matches_dumps(self):
+        samples = [
+            {},
+            [],
+            {"a": 1},
+            {"agent": {"ip": "1.2.3.4", "uptime": "3m"}, "gpios": [{"gpio": 2, "value": 1}, {"gpio": 4, "value": 0}]},
+            {"logs": ["2026-10-23 [Webhook] GPIO 23 \u2192 http://x", "line \"two\""]},
+            {"gpios": {"23": {"type": "output", "init": 0}, "19": {"name": "b", "pullup": None}}, "name": "esp32"},
+            {"nested": {"deep": {"deeper": [1, [2, 3], {"x": True}]}}},
+            "plain", 7, None,
+        ]
+        for obj in samples:
+            self.assertEqual("".join(self.app["_json_pieces"](obj)), json.dumps(obj), repr(obj))
 
 
 if __name__ == "__main__":

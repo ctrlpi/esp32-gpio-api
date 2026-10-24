@@ -34,8 +34,7 @@ only correct where the hardware forces it (pin tables, in-process sensor scripts
 
 ## The README is locked
 
-`README.md` is finished public documentation. **Never edit it without the user's explicit
-confirmation first**, not even a typo or a formatting fix.
+`README.md` is done. Do not edit it without the user's explicit confirmation, even for a small wording or formatting fix, and even to keep it in sync with another project's README.
 
 ## Architecture (`app.py`, top to bottom)
 
@@ -49,8 +48,8 @@ confirmation first**, not even a typo or a formatting fix.
 | `Blinker` | Status LED, driven by `machine.Timer(0)`; on the S3 it writes `LED_RGB_COLOR` (dim green) through `neopixel` instead of a pin level |
 | `WebhookSender` | Keep-alive HTTP(S) client for webhook POSTs |
 | `GPIOManager` | Config/status persistence, pins, IRQ watches, sensors, logs, webhooks |
-| Wi-Fi / time | `_read_wifi()`, `connect_wifi()`, `sync_time()`, `_gateway_alive()`, `WifiWatchdog` |
-| HTTP plumbing | `_recv_request()`, `_parse_request()`, `_send_all()`, `_send_json()`, `_send_empty()` |
+| Wi-Fi / time | `_read_wifi()`, `connect_wifi()`, `sync_time()`, `_gateway_alive()`, `WifiWatchdog`, then `_largest_free_block()` + `HeapWatch` (heap dead-man) |
+| HTTP plumbing | `_recv_request()`, `_parse_request()`, `_send_all()`, `_json_pieces()`, `_send_json()`, `_send_empty()` |
 | Upgrade | `_http_download()`, `_verify_download()`, `_do_upgrade()` |
 | `handle_request()` | Always closes the socket (500 on `MemoryError`); `_handle_request()` is the route dispatch, one `elif` chain |
 | `main()` | Boot, then the single-threaded accept loop |
@@ -122,15 +121,30 @@ is **never stored**; `_READONLY_KEYS` drops it if a client sends it back. Root a
   MicroPython can grow its own heap into it. When lwIP runs out, a blocking `sendall` never returns,
   so every reply goes through `_send_all()` (non-blocking, 3 s deadline), and request bodies are read
   into one `bytearray` sized from `Content-Length` rather than a bytes object regrown per chunk.
-- **Request bodies** are capped at `MAX_REQUEST_BYTES` (8 KB): an oversized body is drained
-  (`_drain`) and refused as `400`. A chunked body (`Transfer-Encoding: chunked`, no
+  Replies are never built whole: `_json_pieces()` yields the JSON (byte-for-byte `ujson.dumps`),
+  `_send_json()` sizes it for an exact `Content-Length`, then sends it in ~`SEND_CHUNK` (512) byte
+  writes. A whole-string `/gpio/scan` reply (~2 KB, plus its bytes copy) was what a classic short of
+  system RAM could not send (`api-tester` test 17). If the system heap still runs out, `HeapWatch`
+  (the heap dead-man) resets the board: the largest free block under `HEAP_LOW_BYTES` (6 KB) for
+  `HEAP_LOW_SECS` (30 s), checked every `HEAP_CHECK_SECS`, with no pulse pending; it logs `[HEAP]
+  ...` lines. A healthy classic shows 17-23 KB; the hung state measured 3.7 KB.
+- **Request bodies** are capped at `MAX_REQUEST_BYTES` (8 KB): an oversized body is refused as
+  `400` and the socket closed with the rest unread. It used to be drained (up to 64 KB), which filled
+  lwIP's buffers and took a classic off the network at `api-tester` test 54; a client may now see a
+  reset instead of the `400`, which the tester accepts. A chunked body (`Transfer-Encoding: chunked`, no
   `Content-Length`) is refused the same way rather than decoded, since otherwise its unread body
   would reach `/config/load` as `{}`, a full config reset. Same as `pico-gpio-api`; the Pi (`413`, chunked
   decoded) differs on purpose, and `api-tester` accepts both.
 - **No `sh`.** Sensor scripts are `.py` files exec'd in-process with args going to `read(*args)`.
   Same validation as the Pi: a bare filename in `scripts/`, letters/digits args only.
-- **https webhooks** need the `ssl` module (`HTTPS_WEBHOOK_OK`); a build without it gets a clear
-  error instead of a stored URL that never delivers.
+- **https webhooks: S3 and C3 only** (`HTTPS_WEBHOOK_OK`, `_IS_CLASSIC`). A TLS handshake needs
+  roughly 35 KB of contiguous system RAM; a classic ESP32 has about 24 KB free after boot (largest
+  block ~19 KB), and every https POST failed with `OSError(12)` (ENOMEM) on the test rig. So, like
+  the original Pico W, a classic answers `400` to an https `webhook_url` on `/config/update` and
+  stores nothing, and `/config/load` drops one with a `[Config]` log line. A build without the
+  `ssl` module refuses https the same way on every chip. `api-tester` tests a classic like a Pico
+  W: webhook tests 33/34 use its local http listener and 20 asserts the refusal.
+  `test_https_webhook_refused_on_classic` covers it (the unit-test mocks are a classic).
 
 ## Working on a board
 
@@ -182,22 +196,13 @@ with a USB-UART bridge those lines are held HIGH, which fails test 55 (pull-down
 
 Found while testing, not yet done. Each needs the user's go-ahead before it is started.
 
-- **The classic ESP32 dies at tester test 54.** On the DevKit V1 (`esp32-417c`) a full suite has
-  stopped five or six times at test 54 (`test_body_size_limit`: a ~16 KB upload over the 8 KB cap,
-  then a 4 KB one under it). The 4 KB request is closed with no reply, then the board drops off
-  the network entirely: no `/hello`, no ping, and `WifiWatchdog` never recovers it, so the main
-  loop is blocked too. The S3 and C3 pass the same test every time. The likely cause is ESP-IDF
-  system RAM running out (about 24 KB free after boot on a classic, low-water mark near 1 KB),
-  with the unread upload filling lwIP's receive buffers; that is a theory, not yet proven.
-  Recovery today is a power cycle.
-- **Measure before fixing.** Report the system heap in the `/config/read` agent block, from
-  `esp32.idf_heap_info(esp32.HEAP_DATA)`: total free, largest free block, and the low-water mark.
-  Then run tests 50-56 on the classic and watch it at test 54. The agent block is shared with
-  `pi-gpio-api` and `pico-gpio-api`, so decide first whether this is an ESP32-only field.
-- **Then the likely fix.** On a request whose `Content-Length` is over `MAX_REQUEST_BYTES`, close
-  the connection at once instead of reading the rest (up to 64 KB) through `_drain()` just to
-  throw it away. The tester already counts a dropped connection as a valid refusal, but
-  `pi-gpio-api` answers `413`, so this is a deliberate divergence to note in the code.
+- **System heap in the agent block.** Report `esp32.idf_heap_info(esp32.HEAP_DATA)` (total free,
+  largest free block, low-water mark) in `/config/read`. Measured so far with a throwaway sensor
+  script (`api-tester/ESP32-AGENT-NOTES.md`). The agent block is shared with `pi-gpio-api` and
+  `pico-gpio-api`, so decide first whether this is an ESP32-only field.
+- **Short-lived connection state.** Bursts of requests and webhook deliveries take up to ~5 KB of
+  system RAM on a classic for about 120 s (lwIP TIME_WAIT: the agent closes every connection
+  first); it all comes back. Measured, not a leak; no change made.
 - **A setting for the status LED.** The LED pin is fixed per chip (`_detect_default_led()`). A
   `settings.status_led` (a pin number, or `false` to turn it off and free the pin) would let a
   user move or disable it. Open question: whether `pi-gpio-api` and `pico-gpio-api` accept it too.
