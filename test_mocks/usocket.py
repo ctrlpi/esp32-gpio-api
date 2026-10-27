@@ -18,3 +18,19 @@ class socket(_orig_socket):
         if override:
             addr = (addr[0], int(override))
         return super().bind(addr)
+
+    # MicroPython's stream methods, which upgrader.py downloads with.
+    def write(self, data):
+        self.sendall(data)
+        return len(data)
+
+    def _reader(self):
+        if not hasattr(self, "_rfile"):
+            self._rfile = self.makefile("rb")
+        return self._rfile
+
+    def readline(self):
+        return self._reader().readline()
+
+    def read(self, n=-1):
+        return self._reader().read(n)

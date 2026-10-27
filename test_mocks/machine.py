@@ -65,6 +65,15 @@ class Timer:
 def unique_id():
     return b"\x12\x34\x56\x78\x9a\xbc"
 
+PWRON_RESET = 1
+HARD_RESET = 2
+WDT_RESET = 3
+DEEPSLEEP_RESET = 4
+SOFT_RESET = 5
+
+def reset_cause():
+    return PWRON_RESET
+
 def reset():
     sys.exit(0)
 

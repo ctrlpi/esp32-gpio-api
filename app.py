@@ -3,6 +3,7 @@
 import gc
 import machine
 import micropython
+from micropython import const
 import network
 import os
 import usocket
@@ -23,37 +24,48 @@ except ImportError:
 # Constants
 
 # Used only when wifi.txt has no SSID / PASSWORD.
-FALLBACK_SSID     = "MyNetwork"
-FALLBACK_PASSWORD = "MyPassword"
-DEFAULT_API_KEY   = "your-secret-key"
-VERSION           = "0.9.27"  # API version
-DEFAULT_LOG_DAYS  = 7
-PORT              = 8314
-WIFI_DEAD_SECS    = 40    # dead-man switch: reset if WiFi stays lost this long
-WIFI_PROBE_SECS   = 120   # idle this long: probe the gateway, then this often
-WIFI_RECONNECT_SECS = 20  # a soft reconnect gets this long before the board resets
-HEAP_LOW_BYTES    = 6144  # heap dead-man: largest free system-RAM block below this...
-HEAP_LOW_SECS     = 30    # ...for this long (no pulse pending) flushes and resets
-HEAP_CHECK_SECS   = 5     # how often the main loop looks
-WEBHOOK_MIN_MS    = 200   # watch debounce
-WEBHOOK_IDLE_MS   = 90000 # socket idle timeout
-WEBHOOK_RETRIES   = 2     # extra attempts
-WEBHOOK_RETRY_MS  = 30000 # retry delay
+_FALLBACK_SSID    = const("MyNetwork")
+_FALLBACK_PASSWORD = const("MyPassword")
+_DEFAULT_API_KEY  = const("your-secret-key")
+VERSION           = "0.9.30"  # API version
+_DEFAULT_LOG_DAYS = const(7)
+_PORT             = const(8314)
+_WIFI_DEAD_SECS   = const(40)      # dead-man switch: reset if WiFi stays lost this long
+_NTP_RETRY_MS     = const(120000)  # while NTP hasn't set the clock, try again this often
+_WIFI_PROBE_SECS  = const(120)     # idle this long: probe the gateway, then this often
+_WIFI_RECONNECT_SECS = const(20)   # a soft reconnect gets this long before the board resets
+_HEAP_LOW_BYTES   = const(6144)    # heap dead-man: largest free system-RAM block below this...
+_HEAP_LOW_SECS    = const(30)      # ...for this long (no pulse pending) flushes and resets
+_HEAP_CHECK_SECS  = const(5)       # how often the main loop looks
+_HEAP_BOOT_GRACE_SECS = const(180) # ...and never in the first 3 minutes after boot: a C3 idles near 6 KB then
+_WEBHOOK_MIN_MS   = const(200)     # watch debounce
+_WEBHOOK_IDLE_MS  = const(90000)   # socket idle timeout
+_WEBHOOK_RETRIES  = const(2)       # extra attempts
+_WEBHOOK_RETRY_MS = const(30000)   # retry delay
 # Files on flash: the config, its last good copy (read when config.json fails to
 # parse) and each pin's last logical level (restored at boot for init "last").
-CONFIG_FILE       = "config.json"
-BACKUP_FILE       = "config-backup.json"
-STATUS_FILE       = "status.json"
-# POST /upgrade downloads UPGRADE_FILES from here: (name, kind, minimum size in bytes).
+_CONFIG_FILE      = const("config.json")
+_BACKUP_FILE      = const("config-backup.json")
+_STATUS_FILE      = const("status.json")
+# POST /upgrade leaves _UPGRADE_LOCK for upgrader.mpy, which downloads UPGRADE_FILES from
+# here: (name, kind, minimum size in bytes). It reports to _UPGRADE_RESULT.
 UPGRADE_BASE_URL  = "https://raw.githubusercontent.com/ctrlpi/esp32-gpio-api/main/"
 UPGRADE_FILES     = (("app.mpy", "mpy", 2000),
                      ("boot.py", "py", 200),
+                     ("upgrader.mpy", "mpy", 1000),
                      ("main.py", "py", 20))
-# The log is an in-memory ring of LOG_MAX lines; /logs returns the newest LOG_RETURN.
-LOG_MAX           = 50
-LOG_RETURN        = 30
+_UPGRADE_LOCK     = const("upgrade.lock")
+_UPGRADE_RESULT   = const("upgrade-result.json")
+# Collect garbage after this many bytes are allocated, not only when an allocation fails: on
+# an ESP32 the heap grows into the system RAM the network stack needs when it runs out.
+_GC_THRESHOLD     = const(16384)
+# Why the agent last reset itself, written just before; logged and removed at the next boot.
+_RESET_NOTE       = const("last-reset.txt")
+# The log is an in-memory ring of _LOG_MAX lines; /logs returns the newest _LOG_RETURN.
+_LOG_MAX          = const(50)
+_LOG_RETURN       = const(30)
 # Largest request accepted, headers and body together; a bigger one is refused (400).
-MAX_REQUEST_BYTES = 8192
+_MAX_REQUEST_BYTES = const(8192)
 
 # The board string, e.g. "Generic ESP32S3 module with ESP32-S3"; it picks the
 # pin tables and the status LED.
@@ -109,18 +121,19 @@ def _detect_default_led():
 
 LED_PIN, LED_ACTIVE_LOW, LED_RGB = _detect_default_led()
 LED_RGB_COLOR           = (0, 40, 0)  # dim green; a WS2812 at full power is blinding
-LED_TIMER_ID            = 0
+_LED_TIMER_ID           = const(0)
 
 # An https webhook needs the ssl module, and a TLS handshake needs roughly 35 KB of
 # contiguous system RAM. A classic ESP32 has about 24 KB free after boot (largest block
-# ~19 KB), so every https POST fails with ENOMEM: like the original Pico W, it refuses
-# https URLs instead of storing one that never delivers. The S3 and C3 have the room.
-_IS_CLASSIC         = "s3" not in _CHIP and "c3" not in _CHIP
-HTTPS_WEBHOOK_OK    = _HAS_SSL and not _IS_CLASSIC
-HTTPS_WEBHOOK_ERROR = ("https webhook URLs are not supported on a classic ESP32: TLS needs more "
-                       "memory than it has free. Use an http:// URL, or an ESP32-S3 or C3."
-                       if _IS_CLASSIC else
-                       "https webhook URLs require an SSL-enabled MicroPython build")
+# ~19 KB), so every https POST fails with ENOMEM. An ESP32-C3 with the agent loaded failed
+# the same way (MPI_ALLOC_FAILED, X509_ALLOC_FAILED, even right after boot), and its failed
+# handshakes hung the board. Like the original Pico W, both refuse https URLs instead of
+# storing one that never delivers; only the S3 has the room.
+_IS_S3              = "s3" in _CHIP
+HTTPS_WEBHOOK_OK    = _HAS_SSL and _IS_S3
+HTTPS_WEBHOOK_ERROR = ("https webhooks need the ssl module" if _IS_S3 else
+                       "https webhooks are not supported on an ESP32-C3: use http://" if "c3" in _CHIP else
+                       "https webhooks are not supported on a classic ESP32: use http://")
 
 def _is_https(url):
 	return str(url or "").strip().lower().startswith("https://")
@@ -132,7 +145,7 @@ _STATUS_TEXT = {
 }
 
 # Sensors run scripts from this folder only (see _sensor_script_parts).
-SCRIPTS_DIR = "scripts"
+_SCRIPTS_DIR = const("scripts")
 # Keys a client may see but never set. `agent` is computed live on every read
 # (platform/os/ip/cpu_temperature/version), so it is dropped from whatever comes in
 # on /config/update and /config/load rather than being written to config.json - a
@@ -174,6 +187,13 @@ def _normalize_config(data):
 # (4242 -> "4242"), so a key typed as digits never locks the agent.
 def _as_text(v):
 	return str(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v
+
+# A usable api_key is non-empty text (a number counts, as text). Anything else, empty,
+# null or another type, counts as no key: the default on load, the current key on
+# /config/load, ignored on /config/update.
+def _valid_key(v):
+	v = _as_text(v)
+	return v if isinstance(v, str) and v else None
 
 def _text_fields(out):
 	for k in ("name", "api_key"):
@@ -243,7 +263,60 @@ def _sensor_script_parts(script):
 	for a in parts[1:]:
 		if not _is_alnum(a):
 			return "script args must be letters and digits only", None, None
-	return None, SCRIPTS_DIR + "/" + parts[0], parts[1:]
+	return None, _SCRIPTS_DIR + "/" + parts[0], parts[1:]
+
+# /script/* (list, read, write, run) over _SCRIPTS_DIR. A name is a sensor script name
+# without a leading "-", up to _SCRIPT_NAME_MAX characters. Writes are refused (403) on the
+# default api_key and while write.lock exists; a write may create the lock but not change or
+# remove it. Runs are not locked. write.lock, in any letter case, is never run.
+_SCRIPT_LOCK_FILE = const("write.lock")
+_SCRIPT_NAME_MAX  = const(32)
+_SCRIPT_OUTPUT_CAP = const(2048) # max chars of output a run returns
+
+class ScriptError(Exception):
+	def __init__(self, status, message):
+		super().__init__(message)
+		self.status = status
+
+def _stat(path):
+	try:
+		return os.stat(path)
+	except OSError:
+		return None
+
+# ujson decodes an escaped pair such as \ud83c\udf21 as two characters; join each pair into one.
+def _join_surrogates(s):
+	if not any(0xD800 <= ord(c) <= 0xDFFF for c in s):
+		return s
+	out, hi = [], 0
+	for ch in s:
+		c = ord(ch)
+		if hi and 0xDC00 <= c <= 0xDFFF:
+			out.append(chr(0x10000 + ((hi - 0xD800) << 10) + c - 0xDC00))
+			hi = 0
+			continue
+		if hi:
+			out.append(chr(hi))
+			hi = 0
+		if 0xD800 <= c <= 0xDBFF:
+			hi = c
+		else:
+			out.append(ch)
+	if hi:
+		out.append(chr(hi))
+	return "".join(out)
+
+# Returns (path, stat or None) for a valid name; a subfolder is refused.
+def _script_path(name):
+	if not _is_script_name(name) or name[0] == "-":
+		raise ScriptError(400, "script must be a bare filename in the scripts folder")
+	if len(name) > _SCRIPT_NAME_MAX:
+		raise ScriptError(400, f"script name over {_SCRIPT_NAME_MAX} characters")
+	path = _SCRIPTS_DIR + "/" + name
+	st = _stat(path)
+	if st and st[0] & 0x4000:
+		raise ScriptError(400, "not a regular file")
+	return path, st
 
 # LED blinker
 
@@ -265,7 +338,7 @@ class Blinker:
 					import neopixel
 					self._np = neopixel.NeoPixel(self._led, 1)
 					self._np.write()
-				self._timer = machine.Timer(LED_TIMER_ID)
+				self._timer = machine.Timer(_LED_TIMER_ID)
 			except Exception:
 				self._led = None
 				self._np = None
@@ -330,9 +403,10 @@ class WebhookSender:
 	per POST, so a cheap send never evicts the expensive connection."""
 
 	def __init__(self):
-		self._sock = None
-		self._url  = None
-		self._last = 0
+		self._sock  = None
+		self._url   = None
+		self._last  = 0
+		self._addrs = {}  # (host, port) -> address: DNS has no timeout, so each host is looked up once
 
 	def _close(self):
 		if self._sock:
@@ -350,11 +424,15 @@ class WebhookSender:
 		port = int(port) if port else (443 if proto == "https" else 80)
 		if proto == "https" and not _HAS_SSL:
 			raise OSError("no ssl module")
+		key = (host, port)
+		addr = self._addrs.get(key)
+		if addr is None:
+			addr = self._addrs[key] = usocket.getaddrinfo(host, port)[0][-1]
 		gc.collect()
 		s = usocket.socket()
 		s.settimeout(3)
 		try:
-			s.connect(usocket.getaddrinfo(host, port)[0][-1])
+			s.connect(addr)
 			if proto == "https":
 				gc.collect()
 				ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -362,15 +440,16 @@ class WebhookSender:
 				s = ctx.wrap_socket(s, server_hostname=host)
 			return s, host, "/" + path
 		except Exception:
+			self._addrs.pop(key, None)  # look it up again next time, in case it moved
 			try:
 				s.close()
 			except Exception:
 				pass
 			raise
 
-	# True when the cached https socket has been idle longer than WEBHOOK_IDLE_MS.
+	# True when the cached https socket has been idle longer than _WEBHOOK_IDLE_MS.
 	def _expired(self):
-		return self._sock is not None and utime.ticks_diff(utime.ticks_ms(), self._last) > WEBHOOK_IDLE_MS
+		return self._sock is not None and utime.ticks_diff(utime.ticks_ms(), self._last) > _WEBHOOK_IDLE_MS
 
 	# Called from the main loop: closes an idle cached socket.
 	def maybe_expire(self):
@@ -399,8 +478,9 @@ class WebhookSender:
 			self._check(status)
 			return
 		for attempt in (0, 1):
+			reused = self._sock is not None and self._url == url and not self._expired()
 			try:
-				if self._sock is None or self._url != url or self._expired():
+				if not reused:
 					self._close()
 					self._sock, self._host, self._path = self._connect(url)
 					self._url = url
@@ -410,7 +490,10 @@ class WebhookSender:
 				self._last = utime.ticks_ms()
 			except Exception:
 				self._close()
-				if attempt:
+				# Only a reused socket gets a second try now: the server may simply have closed
+				# it while idle, which fails fast. A fresh connection that failed is left to the
+				# retry queue, so one slow or unreachable target never holds the server twice.
+				if attempt or not reused:
 					raise
 				continue
 			self._check(status)
@@ -475,6 +558,15 @@ class GPIOManager:
 		self._config_dirty = False
 		self._status_dirty = False
 		self._last_flush   = utime.time()
+		# Agent-block fields that don't change while the agent runs, read once (see _agent_info).
+		self._os          = self._get_os()
+		self._serial_hex  = self._serial()
+		self._mac         = ""
+		self._ssid        = ""
+		try:
+			self._config_time = self._config_stamp(os.stat(_CONFIG_FILE)[8])
+		except Exception:
+			self._config_time = ""
 		self._load_config()
 		self._load_status()
 		self._initialize_pins()
@@ -485,33 +577,33 @@ class GPIOManager:
 	# non-input, watched:false, and an invalid init.
 	def _load_config(self):
 		try:
-			with open(CONFIG_FILE) as f:
+			with open(_CONFIG_FILE) as f:
 				self.config = ujson.load(f)
 		except OSError:
 			self.config = {}
 		except Exception as e:
-			self.log(f"[Config] {CONFIG_FILE} is invalid ({e}); loading backup {BACKUP_FILE}")
+			self.log(f"[Config] {_CONFIG_FILE} is invalid ({e}); loading backup {_BACKUP_FILE}")
 			try:
-				with open(BACKUP_FILE) as f:
+				with open(_BACKUP_FILE) as f:
 					self.config = ujson.load(f)
 			except Exception:
 				self.config = {}
-		self.config.setdefault("api_key",       DEFAULT_API_KEY)
+		self.config["api_key"] = _valid_key(self.config.get("api_key")) or _DEFAULT_API_KEY
 		self.config.setdefault("gpios",         {})
 		self.config.setdefault("notifications", {})
 		self.config.setdefault("bridges",       {})
 		self.config.setdefault("settings",      {})
 		self.config.setdefault("sensors",       {})
 		self.config["settings"].setdefault("logs_enabled", True)
-		self.config["settings"].setdefault("log_days", DEFAULT_LOG_DAYS)
+		self.config["settings"].setdefault("log_days", _DEFAULT_LOG_DAYS)
 		try:
 			self.config["settings"]["log_days"] = max(0, min(int(self.config["settings"]["log_days"]), 30))
 		except (TypeError, ValueError):
-			self.config["settings"]["log_days"] = DEFAULT_LOG_DAYS
+			self.config["settings"]["log_days"] = _DEFAULT_LOG_DAYS
 		for g in list(self.config["gpios"]):
 			if not g.isdigit() or int(g) not in GPIO_PINS:
 				del self.config["gpios"][g]
-				self.log(f"[Config] GP{g} dropped (unavailable or reserved on ESP32)")
+				self.log(f"[Config] GP{g} dropped (not usable)")
 				continue
 			conf = self.config["gpios"][g]
 			if conf.get("type") in ("output", "vcc", "gnd"):
@@ -548,8 +640,9 @@ class GPIOManager:
 			return
 		self._config_dirty = False
 		try:
-			with open(CONFIG_FILE, "w") as f:
+			with open(_CONFIG_FILE, "w") as f:
 				ujson.dump(self.config, f)
+			self._config_time = self._config_stamp()
 		except Exception:
 			self._config_dirty = True
 
@@ -558,7 +651,7 @@ class GPIOManager:
 			return
 		self._status_dirty = False
 		try:
-			with open(STATUS_FILE, "w") as f:
+			with open(_STATUS_FILE, "w") as f:
 				ujson.dump(self.status, f)
 		except Exception:
 			self._status_dirty = True
@@ -581,17 +674,17 @@ class GPIOManager:
 	def _backup_config(self):
 		self._flush_config()
 		try:
-			with open(CONFIG_FILE) as src:
+			with open(_CONFIG_FILE) as src:
 				data = src.read()
 		except OSError:
 			return
-		with open(BACKUP_FILE, "w") as dst:
+		with open(_BACKUP_FILE, "w") as dst:
 			dst.write(data)
 
 	# Each pin's last saved logical level, for init "last".
 	def _load_status(self):
 		try:
-			with open(STATUS_FILE) as f:
+			with open(_STATUS_FILE) as f:
 				self.status = ujson.load(f)
 		except Exception:
 			self.status = {}
@@ -681,11 +774,11 @@ class GPIOManager:
 		except Exception:
 			pass
 
-	# At most one webhook per pin every WEBHOOK_MIN_MS (debounce).
+	# At most one webhook per pin every _WEBHOOK_MIN_MS (debounce).
 	def _on_watch_trigger(self, gpio_str):
 		now  = utime.ticks_ms()
 		last = self._last_watch_ms.get(gpio_str)
-		if last is not None and utime.ticks_diff(now, last) < WEBHOOK_MIN_MS:
+		if last is not None and utime.ticks_diff(now, last) < _WEBHOOK_MIN_MS:
 			return
 		self._last_watch_ms[gpio_str] = now
 		self._trigger_webhook(gpio_str)
@@ -946,18 +1039,19 @@ class GPIOManager:
 					pin = machine.Pin(gpio, machine.Pin.IN, None if gpio in INPUT_ONLY_PINS else machine.Pin.PULL_UP)
 
 				level = pin.value()
-				value = (1 - level) if reversed_flag else level
 
 				if probe:
 					machine.Pin(gpio, machine.Pin.IN, None)
 
-				entry = {"gpio": gpio, "level": level, "value": value, "type": pin_type}
+				# `value` equals `level` unless the pin is reversed, so both are sent only then.
+				entry = {"gpio": gpio, "level": level, "type": pin_type}
 				if conf.get("name"):
 					entry["name"] = conf["name"]
 				if pin_type == "input" and conf.get("pullup"):
 					entry["pullup"] = conf["pullup"]
-				if pin_type not in ("vcc", "gnd"):
-					entry["reversed"] = reversed_flag
+				if reversed_flag:
+					entry["value"]    = 1 - level
+					entry["reversed"] = True
 				result.append(entry)
 			except Exception:
 				pass
@@ -1001,51 +1095,61 @@ class GPIOManager:
 
 	# "esp32-" plus the serial's last 4 hex digits, used when no name is set.
 	def _default_name(self):
-		serial = self._serial()
+		serial = self._serial_hex
 		return ("esp32-" + serial[-4:]) if serial else "esp32"
 
 	# Live, non-persisted facts about the machine this agent runs on. Returned under
 	# `agent` by /config/read and /gpio/scan, and never stored in config.json - which
 	# is why _normalize_config() drops it from anything posted back to /config/*.
+	# What can't change while the agent runs (os, serial, mac, the connection's SSID)
+	# is read once; config_updated is set whenever the agent writes config.json.
 	def _agent_info(self):
 		wlan = network.WLAN(network.STA_IF)
 		connected = wlan.isconnected()
 		ip = wlan.ifconfig()[0] if connected else "unknown"
-		ssid, signal = "", None
+		signal = None
 		if connected:
-			for field in ("essid", "ssid"):
-				try:
-					ssid = wlan.config(field) or ""
-					if isinstance(ssid, bytes):
-						ssid = ssid.decode()
-					break
-				except Exception:
-					continue
+			if not self._ssid:
+				self._ssid = self._read_ssid(wlan)
 			try:
 				signal = wlan.status("rssi")
 			except Exception:
 				signal = None
-		try:
-			mac = ":".join("{:02x}".format(b) for b in wlan.config("mac"))
-		except Exception:
-			mac = ""
+		else:
+			self._ssid = ""  # read again on the next connection
+		if not self._mac:
+			try:
+				self._mac = ":".join("{:02x}".format(b) for b in wlan.config("mac"))
+			except Exception:
+				self._mac = ""
 		return {"platform": PLATFORM,
-		        "os": self._get_os(),
+		        "os": self._os,
 		        "host": "esp32",
-		        "serial": self._serial(),
+		        "serial": self._serial_hex,
 		        "ip": ip,
-		        "mac": mac,
-		        "wifi": ssid,
+		        "mac": self._mac,
+		        "wifi": self._ssid,
 		        "signal": signal,
 		        "cpu_temperature": self._cpu_temperature(),
 		        "uptime": _format_uptime(utime.time() - _BOOT_TIME),
 		        "version": VERSION,
-		        "config_updated": self._config_updated()}
+		        "config_updated": self._config_time}
 
-	# config.json's modification time, or "" before NTP has set the clock.
-	def _config_updated(self):
+	# The SSID of the current connection, or "" when the chip can't say.
+	def _read_ssid(self, wlan):
+		for field in ("essid", "ssid"):
+			try:
+				ssid = wlan.config(field) or ""
+				return ssid.decode() if isinstance(ssid, bytes) else ssid
+			except Exception:
+				continue
+		return ""
+
+	# config_updated: when config.json was last written (seconds since the epoch, or now), as
+	# "YYYY-MM-DD HH:MM:SS", or "" before NTP has set the clock.
+	def _config_stamp(self, secs=None):
 		try:
-			t = utime.localtime(os.stat(CONFIG_FILE)[8])
+			t = utime.localtime() if secs is None else utime.localtime(secs)
 			if t[0] < 2023:
 				return ""
 			return "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(*t[:6])
@@ -1074,7 +1178,7 @@ class GPIOManager:
 			},
 			"settings": {
 				"logs_enabled": settings.get("logs_enabled", True),
-				"log_days":     settings.get("log_days", DEFAULT_LOG_DAYS),
+				"log_days":     settings.get("log_days", _DEFAULT_LOG_DAYS),
 			},
 			"sensors":       self.config.get("sensors", {}),
 		}
@@ -1113,6 +1217,7 @@ class GPIOManager:
 		except OSError:
 			return {name: "script not found"}
 		try:
+			gc.collect()  # a script's own allocations need the room (a 5 KB string failed without)
 			ns = {"args": args}
 			exec(src, ns)
 			if callable(ns.get("read")):
@@ -1146,6 +1251,105 @@ class GPIOManager:
 				result[name] = f"error: {e}"
 		return result
 
+	# "locked" (write.lock present), "default_key" (api_key unchanged) or "enabled".
+	def _script_write_state(self):
+		if _stat(_SCRIPTS_DIR + "/" + _SCRIPT_LOCK_FILE):
+			return "locked"
+		if self.config.get("api_key", _DEFAULT_API_KEY) == _DEFAULT_API_KEY:
+			return "default_key"
+		return "enabled"
+
+	# GET /script/list: every file in scripts/ (no subfolders), plus the write state.
+	def list_scripts(self):
+		try:
+			names = sorted(os.listdir(_SCRIPTS_DIR))
+		except OSError:
+			names = []
+		out = []
+		for n in names:
+			st = _stat(_SCRIPTS_DIR + "/" + n)
+			if st and not st[0] & 0x4000 and _is_script_name(n) and n[0] != "-":
+				t = utime.localtime(st[8])
+				out.append({"name": n, "size": st[6],
+				            "modified": "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(*t[:6]) if t[0] >= 2023 else ""})
+		return {"scripts": out, "write": self._script_write_state()}
+
+	# GET /script/read/{name}.
+	def read_script(self, name):
+		path, st = _script_path(name)
+		if not st:
+			raise ScriptError(404, f"Script not found: {name}")
+		with open(path) as f:
+			return {"name": name, "content": f.read()}
+
+	# POST /script/write/{name}: {"content": "..."} creates or overwrites, {"remove": true}
+	# deletes. The text goes to a hidden temp file that is then renamed into place, so a
+	# run never sees half a script.
+	def write_script(self, name, body):
+		path, st = _script_path(name)
+		state = self._script_write_state()
+		if state == "locked":
+			raise ScriptError(403, "script writes are locked (write.lock in scripts/)")
+		if state == "default_key":
+			raise ScriptError(403, "script writes need an api_key other than the default")
+		if body.get("remove"):
+			if st:
+				os.remove(path)
+				self.log(f"[Script] {name} removed")
+			return {"name": name, "status": "removed" if st else "not found"}
+		content = _as_text(body.get("content"))
+		if content is None:
+			raise ScriptError(400, "Send 'content' (text), or 'remove': true to delete the script")
+		if not isinstance(content, str):
+			raise ScriptError(422, "Request body failed validation")
+		content = _join_surrogates(content)
+		try:
+			os.mkdir(_SCRIPTS_DIR)
+		except OSError:
+			pass
+		tmp = _SCRIPTS_DIR + "/." + name + ".tmp"
+		with open(tmp, "w") as f:
+			f.write(content)
+		try:
+			os.rename(tmp, path)
+		except OSError:
+			_rm(path)   # a filesystem that won't rename over an existing file
+			os.rename(tmp, path)
+		size = os.stat(path)[6]
+		self.log(f"[Script] {name} written ({size} bytes)")
+		return {"name": name, "size": size}
+
+	# POST /script/run/{name}: exec'd in-process like a sensor. output is read(*args), or
+	# `result`, as text (JSON for a non-string). A script that raises (SystemExit too) gives
+	# exit_code 1 and "<Error>: <message>". No timeout.
+	def run_script(self, name, body):
+		path, st = _script_path(name)
+		if name.lower() == _SCRIPT_LOCK_FILE:
+			raise ScriptError(400, "write.lock is not a script")
+		if not st:
+			raise ScriptError(404, f"Script not found: {name}")
+		args = body.get("args") or []
+		if not isinstance(args, list):
+			raise ScriptError(422, "Request body failed validation")
+		args = [_as_text(a) for a in args]
+		if any(not isinstance(a, str) for a in args):
+			raise ScriptError(422, "Request body failed validation")
+		if any(not _is_alnum(a) for a in args):
+			raise ScriptError(400, "script args must be letters and digits only")
+		with open(path) as f:
+			src = f.read()
+		code = 0
+		try:
+			gc.collect()  # a script's own allocations need the room (a 5 KB string failed without)
+			ns = {"args": args}
+			exec(src, ns)
+			val = ns["read"](*args) if callable(ns.get("read")) else ns.get("result")
+		except (Exception, SystemExit) as e:
+			code, val = 1, f"{type(e).__name__}: {e}"
+		out = "" if val is None else val if isinstance(val, str) else ujson.dumps(val)
+		self.log(f"[Script] {name} run, exit code {code}")
+		return {"name": name, "exit_code": code, "output": out[:_SCRIPT_OUTPUT_CAP].rstrip()}
+
 	# Applies a partial config update (POST /config/update). The body may spell each
 	# grouped field either inside its group or at the root (_normalize_config folds the
 	# root form in). Every group merges key by key rather than replacing, so a bridge
@@ -1159,8 +1363,8 @@ class GPIOManager:
 		self._backup_config()
 		for k, v in updates.items():
 			if k == "api_key":
-				if v:
-					self.config["api_key"] = v
+				if _valid_key(v):
+					self.config["api_key"] = _valid_key(v)
 			elif k in ("notifications", "bridges"):
 				allowed = (("webhook", "webhook_key") if k == "notifications"
 				           else ("matter", "matter_key", "homekit", "homekit_key",
@@ -1193,15 +1397,16 @@ class GPIOManager:
 		new_config = _normalize_config(new_config)
 		notif = new_config.get("notifications")
 		if not HTTPS_WEBHOOK_OK and isinstance(notif, dict) and _is_https(notif.get("webhook")):
-			self.log(f"[Config] Dropped https webhook URL (not supported on this board): {notif.get('webhook')}")
+			self.log(f"[Config] https webhook dropped: {notif.get('webhook')}")
 			notif["webhook"] = None
-		new_config["api_key"] = new_config.get("api_key", self.config.get("api_key", DEFAULT_API_KEY))
+		new_config["api_key"] = _valid_key(new_config.get("api_key")) or self.config.get("api_key", _DEFAULT_API_KEY)
 		new_config.setdefault("gpios", {})
 		new_config.setdefault("sensors", {})
 		new_config.setdefault("settings", {})
-		new_config["settings"].setdefault("log_days", DEFAULT_LOG_DAYS)
-		with open(CONFIG_FILE, "w") as f:
+		new_config["settings"].setdefault("log_days", _DEFAULT_LOG_DAYS)
+		with open(_CONFIG_FILE, "w") as f:
 			ujson.dump(new_config, f)
+		self._config_time = self._config_stamp()
 		self._reload()
 		return self.get_config()
 
@@ -1224,12 +1429,12 @@ class GPIOManager:
 		except Exception:
 			entry = msg
 		self._log.append(entry)
-		if len(self._log) > LOG_MAX:
+		if len(self._log) > _LOG_MAX:
 			self._log.pop(0)
 
-	# GET /logs: the newest LOG_RETURN lines.
+	# GET /logs: the newest _LOG_RETURN lines.
 	def get_logs(self):
-		return self._log[-LOG_RETURN:]
+		return self._log[-_LOG_RETURN:]
 
 	def clear_logs(self):
 		self._log.clear()
@@ -1240,7 +1445,7 @@ class GPIOManager:
 		if now - self._last_log_cleanup < 3600:
 			return
 		self._last_log_cleanup = now
-		days   = self.config.get("settings", {}).get("log_days", DEFAULT_LOG_DAYS)
+		days   = self.config.get("settings", {}).get("log_days", _DEFAULT_LOG_DAYS)
 		offset = 3600 if days == 0 else days * 86400
 		cutoff = "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(*utime.localtime(now - offset)[:6])
 		self._log = [e for e in self._log if len(e) <= 19 or e[:19] >= cutoff]
@@ -1276,7 +1481,7 @@ class GPIOManager:
 			self._webhook_queue.append((None, 0, url, api_key, utime.ticks_ms()))
 
 	# Called from the main loop: sends the first queued webhook that is due. A failed
-	# one is queued again WEBHOOK_RETRY_MS later, up to WEBHOOK_RETRIES times.
+	# one is queued again _WEBHOOK_RETRY_MS later, up to _WEBHOOK_RETRIES times.
 	def process_webhooks(self):
 		if not self._webhook_queue:
 			return
@@ -1302,9 +1507,45 @@ class GPIOManager:
 			self._webhook_sender.send(url, payload, api_key)
 		except Exception as e:
 			self.log(f"[WEBHOOK] GP{gpio_str} failed: {type(e).__name__} {repr(e)}")
-			if attempts < WEBHOOK_RETRIES:
+			if attempts < _WEBHOOK_RETRIES:
 				self._webhook_queue.append((gpio_str, attempts + 1, url, api_key,
-				                            utime.ticks_add(utime.ticks_ms(), WEBHOOK_RETRY_MS)))
+				                            utime.ticks_add(utime.ticks_ms(), _WEBHOOK_RETRY_MS)))
+
+# Resets
+
+# Every reset the agent makes itself goes through here: it first writes the reason to
+# last-reset.txt, which the next boot logs (_log_reset_cause), since the log itself is in
+# memory and lost with the reset. soft=True keeps the Wi-Fi link (see /upgrade).
+def _reset(reason, soft=False):
+	try:
+		t = utime.localtime()
+		with open(_RESET_NOTE, "w") as f:
+			f.write("{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d} {}".format(*t[:6], reason))
+	except Exception:
+		pass
+	if soft:
+		machine.soft_reset()
+	else:
+		machine.reset()
+
+_RESET_CAUSES = (("PWRON_RESET", "power on"), ("HARD_RESET", "hard reset"), ("WDT_RESET", "watchdog"),
+                 ("DEEPSLEEP_RESET", "deep sleep"), ("SOFT_RESET", "soft reset"))
+
+# Logs why the board started: machine.reset_cause(), plus the agent's own note when it
+# reset itself.
+def _log_reset_cause(manager):
+	try:
+		cause = machine.reset_cause()
+		cause = next((text for name, text in _RESET_CAUSES if getattr(machine, name, None) == cause), str(cause))
+	except Exception:
+		cause = "unknown"
+	try:
+		with open(_RESET_NOTE) as f:
+			note = f.read().strip()
+		_rm(_RESET_NOTE)
+	except OSError:
+		note = ""
+	manager.log(f"[BOOT] Reset cause: {cause}" + (f"; the agent reset itself at {note}" if note else ""))
 
 # Wi-Fi
 
@@ -1327,11 +1568,11 @@ def _read_wifi(path="wifi.txt"):
 # fails. Returns the IP address.
 def connect_wifi():
 	settings = _read_wifi()
-	ssid     = settings.get("SSID")     or FALLBACK_SSID
-	password = settings.get("PASSWORD") or FALLBACK_PASSWORD
+	ssid     = settings.get("SSID")     or _FALLBACK_SSID
+	password = settings.get("PASSWORD") or _FALLBACK_PASSWORD
 
 	if not ssid:
-		print("[Wi-Fi] ERROR: No SSID configured in wifi.txt")
+		print("[Wi-Fi] No SSID in wifi.txt")
 		return "0.0.0.0"
 
 	wlan = network.WLAN(network.STA_IF)
@@ -1373,8 +1614,8 @@ def connect_wifi():
 			1001: "CONNECTING",
 		}
 		status_desc = status_names.get(status_code, f"status {status_code}")
-		print(f"[Wi-Fi] Connection failed ({status_desc}). Resetting board...")
-		machine.reset()
+		print(f"[Wi-Fi] Failed ({status_desc}), resetting")
+		_reset(f"Wi-Fi connect failed ({status_desc})")
 
 	ip = wlan.ifconfig()[0]
 	print(f"[Wi-Fi] Connected! IP: {ip}")
@@ -1387,9 +1628,23 @@ def sync_time():
 		ntptime.settime()
 	except Exception:
 		pass
+	return utime.localtime()[0] >= 2023
 
 # Set again in main() once the clock is synced.
 _BOOT_TIME = utime.time()
+
+# One attempt at NTP, from main() every _NTP_RETRY_MS while the clock is unset (a single
+# try at boot can be lost on a weak link, and the clock would then read 2000 until the
+# next reboot). On success the clock jumps, so _BOOT_TIME moves with it and uptime stays
+# right. Returns when to try next, or None once the clock is set.
+def _retry_ntp(manager):
+	global _BOOT_TIME
+	before = utime.time()
+	if not sync_time():
+		return utime.ticks_ms()
+	_BOOT_TIME += utime.time() - before
+	manager.log("[BOOT] Clock set over NTP")
+	return None
 
 def _format_uptime(seconds):
 	"""Seconds -> the short human string the lab and the dashboards display as-is.
@@ -1432,14 +1687,14 @@ def _wifi_reconnect(wlan):
 	except OSError:
 		pass
 	try:
-		wlan.connect(settings.get("SSID") or FALLBACK_SSID, settings.get("PASSWORD") or FALLBACK_PASSWORD)
+		wlan.connect(settings.get("SSID") or _FALLBACK_SSID, settings.get("PASSWORD") or _FALLBACK_PASSWORD)
 	except OSError:
 		pass
 
 class WifiWatchdog:
 	"""Recovers a link that reports connected but passes nothing. Only while idle: probe the gateway every
-	WIFI_PROBE_SECS, reconnect softly after two failed probes (GPIO untouched), and
-	reset only if the link is still dead WIFI_RECONNECT_SECS later. A link that
+	_WIFI_PROBE_SECS, reconnect softly after two failed probes (GPIO untouched), and
+	reset only if the link is still dead _WIFI_RECONNECT_SECS later. A link that
 	reports disconnected is the dead-man switch's job, not this one's."""
 
 	def __init__(self, wlan, manager, probe=_gateway_alive, reconnect=_wifi_reconnect,
@@ -1457,7 +1712,7 @@ class WifiWatchdog:
 
 	def _hard_reset(self):
 		self._manager._flush_all()
-		machine.reset()
+		_reset("Wi-Fi watchdog: gateway still unreachable after a reconnect")
 
 	def traffic(self):
 		# A request got through, so the link works.
@@ -1475,14 +1730,14 @@ class WifiWatchdog:
 				if self._probe(self._wlan):
 					self.traffic()
 					return
-			if now - self._reconnect_at >= WIFI_RECONNECT_SECS:
-				self._log("still unreachable after reconnect, resetting")
+			if now - self._reconnect_at >= _WIFI_RECONNECT_SECS:
+				self._log("still unreachable, resetting")
 				self._reset()
 			return
 		# busy: a pulse revert is pending, and a probe can block for up to 2 s.
 		if busy or not self._wlan.isconnected():
 			return
-		if now - self._last_ok < WIFI_PROBE_SECS or now - self._last_probe < WIFI_PROBE_SECS:
+		if now - self._last_ok < _WIFI_PROBE_SECS or now - self._last_probe < _WIFI_PROBE_SECS:
 			return
 		self._last_probe = now
 		if self._probe(self._wlan):
@@ -1507,14 +1762,17 @@ def _largest_free_block():
 class HeapWatch:
 	"""Heap dead-man. lwIP and the Wi-Fi driver allocate from system RAM, and a classic ESP32
 	that has run short of it stays half alive: it accepts connections but cannot send a
-	reply, and nothing else resets it. Every HEAP_CHECK_SECS this reads the largest free
-	block; below HEAP_LOW_BYTES for HEAP_LOW_SECS, with no pulse pending, it flushes and
-	resets so the board comes back clean."""
+	reply, and nothing else resets it. Every _HEAP_CHECK_SECS this reads the largest free
+	block; below _HEAP_LOW_BYTES for _HEAP_LOW_SECS, with no pulse pending, it flushes and
+	resets so the board comes back clean. Never within _HEAP_BOOT_GRACE_SECS of its start
+	(main() creates it at boot): an ESP32-C3 measured 5.6 KB in the first minutes after boot
+	and 20-24 KB once settled. A low stretch that began during the grace still counts, so a
+	board still low when the grace ends is reset then."""
 
 	def __init__(self, manager, largest=_largest_free_block, reset=None, now=utime.time):
 		self._manager, self._largest, self._now = manager, largest, now
 		self._reset = reset or self._hard_reset
-		self._checked = now()
+		self._checked = self._started = now()
 		self._low_since = None
 
 	def _log(self, msg):
@@ -1523,23 +1781,23 @@ class HeapWatch:
 
 	def _hard_reset(self):
 		self._manager._flush_all()
-		machine.reset()
+		_reset(f"heap watchdog: largest free block under {_HEAP_LOW_BYTES} bytes")
 
 	def tick(self, busy=False):
 		now = self._now()
-		if now - self._checked < HEAP_CHECK_SECS:
+		if now - self._checked < _HEAP_CHECK_SECS:
 			return
 		self._checked = now
 		largest = self._largest()
-		if largest is None or largest >= HEAP_LOW_BYTES:
+		if largest is None or largest >= _HEAP_LOW_BYTES:
 			if largest is not None and self._low_since is not None:
-				self._log("recovered (largest free block %d bytes)" % largest)
+				self._log("recovered (largest block %d B)" % largest)
 			self._low_since = None
 			return
 		if self._low_since is None:
 			self._low_since = now
-			self._log("largest free block %d bytes, under %d" % (largest, HEAP_LOW_BYTES))
-		elif now - self._low_since >= HEAP_LOW_SECS and not busy:
+			self._log("largest block %d B, under %d" % (largest, _HEAP_LOW_BYTES))
+		elif now - self._low_since >= _HEAP_LOW_SECS and not busy and now - self._started >= _HEAP_BOOT_GRACE_SECS:
 			self._log("still low after %ds, resetting" % (now - self._low_since))
 			self._reset()
 
@@ -1566,7 +1824,7 @@ def _recv_request(conn):
 			break
 		if body is None:
 			data += chunk
-			if len(data) > MAX_REQUEST_BYTES:
+			if len(data) > _MAX_REQUEST_BYTES:
 				return None
 			sep = data.find(b"\r\n\r\n")
 			if sep == -1:
@@ -1585,9 +1843,9 @@ def _recv_request(conn):
 			# No real client sends one here; refuse it (400) instead of decoding it.
 			# Refused requests are not read to the end: the 400 goes out and the socket is
 			# closed with the rest unread. Draining up to 64 KB just to discard it filled
-			# lwIP's buffers and took a classic ESP32 off the network (api-tester test 54).
+			# lwIP's buffers and took a classic ESP32 off the network (api-tester test 53).
 			# The Pi answers 413 after reading; a client may see a reset instead here.
-			if chunked or cl > MAX_REQUEST_BYTES:
+			if chunked or cl > _MAX_REQUEST_BYTES:
 				return None
 			if cl == 0:
 				# No Content-Length: whatever followed the headers is the body.
@@ -1629,9 +1887,13 @@ def _parse_request(req):
 			try:
 				parsed = ujson.loads(tail)
 				body = parsed if isinstance(parsed, dict) else None
+			except MemoryError:
+				raise   # out of heap, not bad JSON: handle_request answers 500, not 422
 			except Exception:
 				body = None
 		return method, path, hdrs, body
+	except MemoryError:
+		raise
 	except Exception:
 		return None
 
@@ -1667,56 +1929,18 @@ def _send_empty(conn, status=404):
 	except Exception:
 		pass
 
-# Yields the JSON text of obj in small pieces that join to exactly ujson.dumps(obj).
-# The top two levels (the reply object and its lists/maps, e.g. scan's gpios) are split;
-# anything deeper is one piece.
-def _json_pieces(obj, depth=2):
-	if depth and isinstance(obj, dict):
-		yield "{"
-		first = True
-		for k, v in obj.items():
-			yield ("" if first else ", ") + ujson.dumps(k) + ": "
-			first = False
-			yield from _json_pieces(v, depth - 1)
-		yield "}"
-	elif depth and isinstance(obj, list):
-		yield "["
-		for i, v in enumerate(obj):
-			if i:
-				yield ", "
-			yield from _json_pieces(v, depth - 1)
-		yield "]"
-	else:
-		yield ujson.dumps(obj)
-
-# Sends a JSON response. Every response closes the connection (no keep-alive).
-# The body is never built as one string: it is sized from its pieces first, then sent
-# in writes of about SEND_CHUNK bytes. A /gpio/scan reply (~2 KB) built whole, plus its
-# bytes copy, was the allocation that a classic ESP32 short of system RAM could not
-# send (api-tester test 17).
-SEND_CHUNK = 512
-
+# Sends a JSON response in one write: one ujson.dumps for the body, sent together with its
+# header, so the client never waits on a delayed ACK between pieces. Every response closes
+# the connection (no keep-alive).
 def _send_json(conn, data, status=200):
-	size = 0
-	for piece in _json_pieces(data):
-		size += len(piece.encode())
-	out = [(
-		f"HTTP/1.1 {status} {_STATUS_TEXT.get(status, 'Error')}\r\n"
-		f"Content-Type: application/json\r\n"
-		f"Content-Length: {size}\r\n"
-		f"Connection: close\r\n\r\n"
-	).encode()]
-	n = len(out[0])
+	body = ujson.dumps(data).encode()
 	try:
-		for piece in _json_pieces(data):
-			b = piece.encode()
-			out.append(b)
-			n += len(b)
-			if n >= SEND_CHUNK:
-				_send_all(conn, b"".join(out))
-				out, n = [], 0
-		if out:
-			_send_all(conn, b"".join(out))
+		_send_all(conn, (
+			f"HTTP/1.1 {status} {_STATUS_TEXT.get(status, 'Error')}\r\n"
+			f"Content-Type: application/json\r\n"
+			f"Content-Length: {len(body)}\r\n"
+			f"Connection: close\r\n\r\n"
+		).encode() + body)
 	except Exception:
 		pass
 
@@ -1729,171 +1953,35 @@ def _rm(path):
 	except Exception:
 		pass
 
-# None if the file looks right (a .mpy header, or Python text) and has the expected
-# size, else the reason.
-def _verify_download(path, size, kind):
-	try:
-		with open(path, "rb") as f:
-			head = f.read(256)
-			if kind == "mpy":
-				if not head.startswith(b"M"):
-					return "invalid mpy header"
-			elif b"import" not in head:
-				return "import missing"
-			f.seek(0)
-			total = 0
-			while True:
-				chunk = f.read(512)
-				if not chunk:
-					break
-				if kind == "py" and b"\x00" in chunk:
-					return "binary data in file"
-				total += len(chunk)
-	except Exception as e:
-		return "unreadable: " + str(e)
-	if total != size:
-		return f"size mismatch (wrote {size}, read back {total})"
-	return None
-
-# Downloads url to dest (http or https, certificate not verified) with a
-# Content-Length, chunked or read-to-close body. Returns the byte count; raises on
-# any error or short read.
-def _http_download(url, dest):
-	proto, rest = url.split("://", 1)
-	host_port, _, path = rest.partition("/")
-	host, _, port = host_port.partition(":")
-	port = int(port) if port else (443 if proto == "https" else 80)
-	if proto == "https" and not _HAS_SSL:
-		raise OSError("no ssl module")
-	gc.collect()
-	s = usocket.socket()
-	s.settimeout(15)
-	try:
-		s.connect(usocket.getaddrinfo(host, port)[0][-1])
-		if proto == "https":
-			ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-			ctx.verify_mode = ssl.CERT_NONE
-			s = ctx.wrap_socket(s, server_hostname=host)
-		s.write(("GET /{} HTTP/1.1\r\nHost: {}\r\nUser-Agent: ctrlpi-esp32\r\n"
-		         "Accept: */*\r\nConnection: close\r\n\r\n").format(path, host).encode())
-		line = s.readline()
-		if not line or not line.startswith(b"HTTP/"):
-			raise OSError("bad response")
-		status = int(line.split(b" ")[1])
-		if status != 200:
-			raise OSError(f"HTTP {status}")
-		cl, chunked = None, False
-		while True:
-			line = s.readline()
-			if not line or line == b"\r\n":
-				break
-			ll = line.lower()
-			if ll.startswith(b"content-length:"):
-				cl = int(line.split(b":", 1)[1])
-			elif ll.startswith(b"transfer-encoding:") and b"chunked" in ll:
-				chunked = True
-		total = 0
-		with open(dest, "wb") as f:
-			if chunked:
-				complete = False
-				while True:
-					size_line = s.readline()
-					if not size_line:
-						break
-					size = int(size_line.strip().split(b";")[0], 16)
-					if size == 0:
-						complete = True
-						break
-					left = size
-					while left > 0:
-						chunk = s.read(min(left, 512))
-						if not chunk:
-							raise OSError("short read")
-						f.write(chunk); total += len(chunk); left -= len(chunk)
-					s.readline()
-				if not complete:
-					raise OSError("truncated chunked body")
-			elif cl is not None:
-				left = cl
-				while left > 0:
-					chunk = s.read(min(left, 512))
-					if not chunk:
-						break
-					f.write(chunk); total += len(chunk); left -= len(chunk)
-				if left > 0:
-					raise OSError("short read")
-			else:
-				while True:
-					chunk = s.read(512)
-					if not chunk:
-						break
-					f.write(chunk); total += len(chunk)
-		return total
-	finally:
-		try:
-			s.close()
-		except Exception:
-			pass
-
-# POST /upgrade: downloads every file in UPGRADE_FILES as <name>.new and checks
-# each one. Only when all are good are they swapped in, keeping <name>.backup; if
-# any step of the swap fails, the backups are put back. The caller resets the
-# board on success.
+# POST /upgrade: leaves upgrade.lock for main.py and lets the caller soft-reset (the
+# Wi-Fi link stays up), so the download runs in upgrader.mpy on a fresh heap. A board
+# installed without upgrader.mpy answers 500 and is upgraded over USB.
 def _do_upgrade(manager):
-	downloaded = []
-	for filename, kind, minimum in UPGRADE_FILES:
-		tmp = filename + ".new"
-		url = UPGRADE_BASE_URL + filename
-		manager.log("[UPGRADE] downloading " + filename)
-		try:
-			n = _http_download(url, tmp)
-		except Exception as e:
-			for item in UPGRADE_FILES:
-				_rm(item[0] + ".new")
-			return (False, {"error": filename + " download failed: " + str(e)}, 502)
-		if n < minimum:
-			for item in UPGRADE_FILES:
-				_rm(item[0] + ".new")
-			return (False, {"error": filename + f" is too small ({n} bytes)"}, 502)
-		bad = _verify_download(tmp, n, kind)
-		if bad:
-			for item in UPGRADE_FILES:
-				_rm(item[0] + ".new")
-			return (False, {"error": filename + " failed verification: " + bad}, 502)
-		downloaded.append((filename, kind, n))
-
-	installed = []
 	try:
-		for filename, kind, n in downloaded:
-			bak = filename + ".backup"
-			_rm(bak)
-			os.rename(filename, bak)
-			installed.append((filename, kind, n))
-			os.rename(filename + ".new", filename)
-		for filename, kind, n in downloaded:
-			bad = _verify_download(filename, n, kind)
-			if bad:
-				raise OSError(filename + ": " + bad)
+		os.stat("upgrader.mpy")
+	except OSError:
+		return (False, {"error": "upgrader.mpy missing: install over USB"}, 500)
+	try:
+		with open(_UPGRADE_LOCK, "w") as f:
+			ujson.dump({"url": UPGRADE_BASE_URL, "files": UPGRADE_FILES, "attempt": 0}, f)
 	except Exception as e:
-		recovery = "restored previous files"
-		try:
-			for filename, kind, n in installed:
-				bak = filename + ".backup"
-				try:
-					os.stat(bak)
-				except OSError:
-					continue
-				_rm(filename)
-				os.rename(bak, filename)
-		except Exception as restore_error:
-			recovery = "restore failed: " + str(restore_error)
-		for item in UPGRADE_FILES:
-			_rm(item[0] + ".new")
-		manager.log("[UPGRADE] install failed; " + recovery)
-		return (False, {"error": "install failed: " + str(e), "recovery": recovery}, 500)
-
-	manager.log("[UPGRADE] app.mpy, boot.py and main.py replaced")
+		_rm(_UPGRADE_LOCK)
+		return (False, {"error": "could not write upgrade.lock: " + str(e)}, 500)
+	manager.log("[UPGRADE] Restarting")
 	return (True, {"status": "upgrading"}, 200)
+
+# Logs what upgrader.mpy reported, once.
+def _log_upgrade_result(manager):
+	try:
+		with open(_UPGRADE_RESULT) as f:
+			result = ujson.load(f)
+	except Exception:
+		return
+	_rm(_UPGRADE_RESULT)
+	if result.get("ok"):
+		manager.log(f"[UPGRADE] Done, now {VERSION}: {result.get('message', '')}")
+	else:
+		manager.log(f"[UPGRADE] Failed, still {VERSION}: {result.get('message', '')}")
 
 # Requests
 
@@ -1905,7 +1993,7 @@ def handle_request(conn, manager):
 		_handle_request(conn, manager)
 	except MemoryError:
 		gc.collect()
-		manager.log("[ERROR] Out of memory while handling a request")
+		manager.log("[ERROR] Out of memory")
 		_send_json(conn, {"error": "Out of memory"}, 500)
 	finally:
 		try:
@@ -1937,7 +2025,8 @@ def _handle_request(conn, manager):
 			conn.close()
 			return
 
-		if hdrs.get("api-key") != manager.config.get("api_key", DEFAULT_API_KEY):
+		key = hdrs.get("api-key")
+		if not key or key != manager.config.get("api_key", _DEFAULT_API_KEY):
 			_send_json(conn, {"error": "Invalid or missing Api-Key header"}, 403)
 			conn.close()
 			return
@@ -1962,6 +2051,14 @@ def _handle_request(conn, manager):
 			_send_json(conn, manager.read_sensors())
 		elif method == "GET"  and path.startswith("/sensor/read/"):
 			_send_json(conn, manager.read_sensor(path[len("/sensor/read/"):]))
+		elif method == "GET"  and path == "/script/list":
+			_send_json(conn, manager.list_scripts())
+		elif method == "GET"  and path.startswith("/script/read/"):
+			_send_json(conn, manager.read_script(path[len("/script/read/"):]))
+		elif method == "POST" and path.startswith("/script/write/"):
+			_send_json(conn, manager.write_script(path[len("/script/write/"):], body))
+		elif method == "POST" and path.startswith("/script/run/"):
+			_send_json(conn, manager.run_script(path[len("/script/run/"):], body))
 		elif method == "GET"  and path == "/gpio/scan":
 			_send_json(conn, manager.scan_all())
 		elif method == "GET"  and path == "/config/read":
@@ -1978,7 +2075,7 @@ def _handle_request(conn, manager):
 				conn.close()
 				manager._flush_all()
 				utime.sleep_ms(500)
-				machine.reset()
+				_reset("POST /upgrade", soft=True)
 		# reboot: true resets the board; otherwise pins and config reload in place.
 		elif method == "POST" and path == "/restart":
 			reboot = bool(body.get("reboot", False))
@@ -1988,12 +2085,13 @@ def _handle_request(conn, manager):
 			if reboot:
 				utime.sleep_ms(500)
 				try:
-					machine.reset()
+					_reset("POST /restart (reboot)")
 				except Exception as e:
 					manager.log(f"[CONFIG] Reboot failed: {e}; falling back to soft restart")
 					try:
 						machine.soft_reset()
 					except Exception:
+						_rm(_RESET_NOTE)  # no reset after all
 						manager._reload()
 						manager.log("[BOOT] In-process restart via /restart")
 			else:
@@ -2004,6 +2102,11 @@ def _handle_request(conn, manager):
 		else:
 			_send_empty(conn, 404)
 
+	except ScriptError as e:
+		if e.status == 404:
+			_send_empty(conn, 404)
+		else:
+			_send_json(conn, {"error": str(e)}, e.status)
 	except PinNotFound:
 		_send_empty(conn, 404)
 	except Exception as e:
@@ -2020,15 +2123,19 @@ def _handle_request(conn, manager):
 # loop: the deferred work (log trimming, flash writes, pulse reverts, webhooks) and
 # one request per accept(). accept() waits 1 s, or 50 ms while a revert is pending.
 def main():
+	if hasattr(gc, "threshold"):  # MicroPython only; the CPython unit tests have none
+		gc.threshold(_GC_THRESHOLD)
 	BLINKER.start_fast()
 	ip      = connect_wifi()
-	sync_time()
+	ntp_retry = None if sync_time() else utime.ticks_ms()
 	global _BOOT_TIME
 	_BOOT_TIME = utime.time()
 	manager = GPIOManager()
+	_log_upgrade_result(manager)
+	_log_reset_cause(manager)
 	manager.queue_boot_webhook()
 
-	addr   = usocket.getaddrinfo("0.0.0.0", PORT)[0][-1]
+	addr   = usocket.getaddrinfo("0.0.0.0", _PORT)[0][-1]
 	server = usocket.socket(usocket.AF_INET, usocket.SOCK_STREAM)
 	server.setsockopt(usocket.SOL_SOCKET, usocket.SO_REUSEADDR, 1)
 	# The port can stay busy briefly after a soft reset: retry, then reset.
@@ -2041,7 +2148,7 @@ def main():
 				if attempt == 2:
 					manager.log("[BOOT] Port 8314 in use, hard resetting...")
 					utime.sleep(0.5)
-					machine.reset()
+					_reset("port 8314 in use")
 				manager.log(f"[BOOT] Port in use, retrying ({attempt+1}/2)...")
 				utime.sleep(2)
 			else:
@@ -2049,14 +2156,14 @@ def main():
 	server.listen(3)
 	server.settimeout(1)
 
-	manager.log(f"[BOOT] Listening on {ip}:{PORT}")
-	print(f"[BOOT] HTTP server listening on http://{ip}:{PORT}")
+	manager.log(f"[BOOT] Listening on {ip}:{_PORT}")
+	BLINKER.stop_fast()  # booting is over: Wi-Fi is up and the server answers
+	print(f"[BOOT] Listening on {ip}:{_PORT}")
 
 	wlan         = network.WLAN(network.STA_IF)
 	wifi_last_ok = utime.time()
 	watchdog     = WifiWatchdog(wlan, manager)
 	heap_watch   = HeapWatch(manager)
-	boot_blink   = True
 
 	while True:
 		try:
@@ -2065,18 +2172,16 @@ def main():
 			manager.process_reverts()
 			manager.process_webhooks()
 			manager._webhook_sender.maybe_expire()
-			# Fast blinking ends once the boot webhook has gone out (or there was none).
-			if boot_blink and not any(e[0] is None for e in manager._webhook_queue):
-				boot_blink = False
-				BLINKER.stop_fast()
+			if ntp_retry is not None and utime.ticks_diff(utime.ticks_ms(), ntp_retry) >= _NTP_RETRY_MS:
+				ntp_retry = _retry_ntp(manager)
 			server.settimeout(0.05 if manager._pending_reverts else 1)
 			now = utime.time()
-			# Dead-man switch: reset when Wi-Fi has been down for WIFI_DEAD_SECS.
+			# Dead-man switch: reset when Wi-Fi has been down for _WIFI_DEAD_SECS.
 			if wlan.isconnected():
 				wifi_last_ok = now
-			elif now - wifi_last_ok > WIFI_DEAD_SECS:
+			elif now - wifi_last_ok > _WIFI_DEAD_SECS:
 				manager._flush_all()
-				machine.reset()
+				_reset(f"Wi-Fi down for over {_WIFI_DEAD_SECS} s")
 			watchdog.tick(busy=bool(manager._pending_reverts))
 			heap_watch.tick(busy=bool(manager._pending_reverts))
 			conn, _ = server.accept()

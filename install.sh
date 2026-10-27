@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # Usage: curl -fsSL https://raw.githubusercontent.com/ctrlpi/esp32-gpio-api/main/install.sh | bash
 #
-# Deploys boot.py, app.mpy, main.py and device settings to every ESP32 on USB.
+# Deploys boot.py, app.mpy, upgrader.mpy, main.py and device settings to every ESP32 on USB.
 # Runs on your Mac/PC - MicroPython has no shell to run this on the device itself.
 # Downloads the release files when piped into a shell or run with --upgrade; a plain
 # ./install.sh deploys the files already on disk. Prompts only for what the device lacks.
 #
-#   ./install.sh              # full deploy: boot.py + app.mpy + main.py + config/wifi as needed
+#   ./install.sh              # full deploy: boot.py + app.mpy + upgrader.mpy + main.py + config/wifi as needed
 #   ./install.sh --config     # re-ask for API key/agent name even if the device already has config.json
 #   ./install.sh --wifi       # re-ask for WiFi SSID/password even if the device already has wifi.txt
+#   ./install.sh --unlock     # install nothing: delete scripts/write.lock on every ESP32, then reset it
 set -euo pipefail
 
 BASE_URL="https://raw.githubusercontent.com/ctrlpi/esp32-gpio-api/main"
-FILES="app.py app.mpy main.py boot.py build.sh install.sh LICENSE README.md"
+FILES="app.py app.mpy upgrader.py upgrader.mpy main.py boot.py build.sh install.sh LICENSE README.md"
 DIR="esp32-gpio-api"
 SHELLS=(bash sh dash zsh ksh ash)
 
@@ -24,11 +25,14 @@ for s in "${SHELLS[@]}"; do
 done
 FORCE_WIFI=false
 FORCE_CONFIG=false
+UNLOCK=false
 for arg in "$@"; do
   [ "$arg" = "--upgrade" ] && DOWNLOAD=true
   [ "$arg" = "--wifi" ] && FORCE_WIFI=true
   [ "$arg" = "--config" ] && FORCE_CONFIG=true
+  [ "$arg" = "--unlock" ] && UNLOCK=true
 done
+[ "$UNLOCK" = false ] || DOWNLOAD=false
 
 if [ "$DOWNLOAD" = true ] && ! command -v curl >/dev/null 2>&1; then
   echo "Error: curl is required. Install it first (e.g. brew install curl)." >&2
@@ -52,12 +56,15 @@ if [ "$DOWNLOAD" = true ]; then
   chmod +x "$DIR/install.sh" "$DIR/build.sh"
 fi
 
-for f in app.py main.py boot.py build.sh; do
-  if [ ! -f "$DIR/$f" ]; then
-    echo "ERROR: missing $DIR/$f. Restore the local file or run ./install.sh --upgrade." >&2
-    exit 1
-  fi
-done
+# --unlock deploys nothing, so it needs none of the release files.
+if [ "$UNLOCK" = false ]; then
+  for f in app.py upgrader.py main.py boot.py build.sh; do
+    if [ ! -f "$DIR/$f" ]; then
+      echo "ERROR: missing $DIR/$f. Restore the local file or run ./install.sh --upgrade." >&2
+      exit 1
+    fi
+  done
+fi
 
 # --- venv + USB tool ---
 VENV_DIR="$DIR/venv"
@@ -74,7 +81,8 @@ if [ ! -x "$VENV_DIR/bin/mpremote" ]; then
 fi
 MPREMOTE="$VENV_DIR/bin/mpremote"
 
-if [ ! -f "$DIR/app.mpy" ] || [ "$DIR/app.py" -nt "$DIR/app.mpy" ]; then
+if [ "$UNLOCK" = false ] && { [ ! -f "$DIR/app.mpy" ] || [ "$DIR/app.py" -nt "$DIR/app.mpy" ] ||
+                             [ ! -f "$DIR/upgrader.mpy" ] || [ "$DIR/upgrader.py" -nt "$DIR/upgrader.mpy" ]; }; then
   "$DIR/build.sh"
 fi
 
@@ -113,15 +121,23 @@ ask_required() {
 }
 
 # --- find connected ESP32 boards (checks below query the first one) ---
+# Each port is asked what it is, and only an ESP32, ESP32-S3 or ESP32-C3 running MicroPython
+# is installed (the S2 has no agent). Asking stops the board's program, so any other board
+# that answers is reset and carries on.
 shopt -s nullglob
 CANDIDATES=(/dev/cu.usbserial-* /dev/cu.usbmodem* /dev/ttyUSB* /dev/ttyACM*)
 shopt -u nullglob
 DEVICES=()
+ESP32_S2='esp32-?s2'
 if [ "${#CANDIDATES[@]}" -gt 0 ]; then
   for DEV in "${CANDIDATES[@]}"; do
-    if BOARD_OS="$("$MPREMOTE" connect "$DEV" exec "import os; print(os.uname().sysname)" 2>/dev/null)" &&
-       [ "$(printf '%s' "$BOARD_OS" | tr -d '\r\n')" = "esp32" ]; then
+    BOARD="$("$MPREMOTE" connect "$DEV" exec "import os; print(os.uname().sysname + '|' + os.uname().machine)" 2>/dev/null | tr -d '\r' | tail -1)" || BOARD=""
+    MACHINE="$(printf '%s' "${BOARD#*|}" | tr '[:upper:]' '[:lower:]')"
+    if [ "${BOARD%%|*}" = "esp32" ] && ! [[ $MACHINE =~ $ESP32_S2 ]]; then
       DEVICES+=("$DEV")
+    elif [ -n "$BOARD" ]; then
+      echo "Skipping $DEV: ${BOARD#*|} is not an ESP32, ESP32-S3 or ESP32-C3"
+      "$MPREMOTE" connect "$DEV" reset >/dev/null 2>&1 || true
     fi
   done
 fi
@@ -130,6 +146,24 @@ if [ "${#DEVICES[@]}" -eq 0 ]; then
   exit 1
 fi
 echo "Found ${#DEVICES[@]} ESP32 device(s): ${DEVICES[*]}"
+
+# --- --unlock: only delete scripts/write.lock (/script/write can create it, never remove it).
+# mpremote stops the running agent, so every board is reset afterwards, locked or not.
+if [ "$UNLOCK" = true ]; then
+  FAILED=0
+  for DEV in "${DEVICES[@]}"; do
+    if ! "$MPREMOTE" connect "$DEV" fs cat :scripts/write.lock >/dev/null 2>&1; then
+      echo "$DEV: no scripts/write.lock, script writes were not locked."
+    elif "$MPREMOTE" connect "$DEV" fs rm :scripts/write.lock >/dev/null; then
+      echo "$DEV: removed scripts/write.lock, script writes are unlocked."
+    else
+      echo "  FAILED: $DEV - could not remove scripts/write.lock" >&2
+      FAILED=1
+    fi
+    "$MPREMOTE" connect "$DEV" reset >/dev/null 2>&1 || true
+  done
+  exit "$FAILED"
+fi
 
 # --- config.json: API key + agent name. Only asked for when the *device* doesn't
 # already have one (--config forces the prompt). A blank name keeps the device's own
@@ -217,8 +251,11 @@ for DEV in "${DEVICES[@]}"; do
   if [ "$NEED_SCRIPT" = true ]; then
     CMD_ARGS+=("exec" "import os; 'scripts' not in os.listdir() and os.mkdir('scripts')" "+")
   fi
+  # A leftover upgrade.lock would boot the upgrader and replace what is installed here.
+  CMD_ARGS+=("exec" "import os; 'upgrade.lock' in os.listdir() and os.remove('upgrade.lock')" "+")
   CMD_ARGS+=("fs" "cp" "$DIR/boot.py" ":boot.py" "+")
   CMD_ARGS+=("fs" "cp" "$DIR/app.mpy" ":app.mpy" "+")
+  CMD_ARGS+=("fs" "cp" "$DIR/upgrader.mpy" ":upgrader.mpy" "+")
   CMD_ARGS+=("fs" "cp" "$DIR/main.py" ":main.py")
   if [ "$NEED_CONFIG" = true ]; then
     CMD_ARGS+=("+" "fs" "cp" "$CONFIG_FILE" ":config.json")

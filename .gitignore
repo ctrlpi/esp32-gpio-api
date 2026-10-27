@@ -23,4 +23,5 @@ scripts/
 wifi.txt
 *.mpy
 !app.mpy
+!upgrader.mpy
 min/

@@ -15,7 +15,9 @@ if [ ! -x "$VENV_DIR/bin/mpy-cross" ] ||
   "$VENV_DIR/bin/pip" install --quiet --upgrade pip 'mpy-cross==1.29.0.post2'
 fi
 
-echo "Building app.mpy..."
-# -s: embed just "app.py" as the source name, not this machine's absolute path.
-"$VENV_DIR/bin/mpy-cross" -s app.py -o "$DIR/app.mpy.tmp" "$DIR/app.py"
-mv "$DIR/app.mpy.tmp" "$DIR/app.mpy"
+for name in app upgrader; do
+  echo "Building $name.mpy..."
+  # -s: embed just "$name.py" as the source name, not this machine's absolute path.
+  "$VENV_DIR/bin/mpy-cross" -s "$name.py" -o "$DIR/$name.mpy.tmp" "$DIR/$name.py"
+  mv "$DIR/$name.mpy.tmp" "$DIR/$name.mpy"
+done

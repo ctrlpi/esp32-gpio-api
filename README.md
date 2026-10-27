@@ -1,7 +1,7 @@
 # ESP32 GPIO API
 
 [![Platform: ESP32](https://img.shields.io/badge/platform-ESP32-E7352C.svg)](#install-on-your-esp32)
-[![Version 0.9.27](https://img.shields.io/badge/version-0.9.27-blue.svg)](https://github.com/ctrlpi/esp32-gpio-api/tags)
+[![Version 0.9.30](https://img.shields.io/badge/version-0.9.30-blue.svg)](https://github.com/ctrlpi/esp32-gpio-api/tags)
 [![MicroPython 1.29](https://img.shields.io/badge/runtime-MicroPython%201.29-blue.svg)](#install-on-your-esp32)
 [![Auth: Api-Key](https://img.shields.io/badge/auth-Api--Key-orange.svg)](#authentication)
 [![License: MIT](https://img.shields.io/badge/license-MIT-188038.svg)](LICENSE)
@@ -33,7 +33,7 @@ curl -fsSL https://raw.githubusercontent.com/ctrlpi/esp32-gpio-api/main/install.
 
 `install.sh` preserves device `config.json` and `wifi.txt`, asking only for missing values. It deploys every detected USB ESP32 and removes locally staged credentials afterward.
 
-Re-running `./install.sh` uses local files. It runs `build.sh` only when `app.mpy` is missing or older than `app.py`.
+Re-running `./install.sh` uses local files. It runs `build.sh` only when `app.mpy` or `upgrader.mpy` is missing or older than its source.
 
 - `./install.sh --config`: re-ask for the API key/agent name and push it, even if the device already has `config.json`.
 - `./install.sh --wifi`: re-ask for WiFi SSID/password and push it, even if the device already has `wifi.txt`.
@@ -47,7 +47,7 @@ cd esp32-gpio-api
 ./install.sh
 ```
 
-Or copy `boot.py`, `app.mpy`, `main.py`, and `wifi.txt` to the ESP32 manually.
+Or copy `boot.py`, `app.mpy`, `upgrader.mpy`, `main.py`, and `wifi.txt` to the ESP32 manually.
 
 ```
 SSID = YourNetwork
@@ -58,7 +58,7 @@ PASSWORD = YourPassword
 
 ### Run automatically at boot
 
-MicroPython runs `boot.py` and `main.py` automatically. `boot.py` reserves Wi-Fi memory, then `main.py` loads `app.mpy`.
+MicroPython runs `boot.py` and `main.py` automatically. `boot.py` reserves Wi-Fi memory, then `main.py` loads `app.mpy` (or `upgrader.mpy` during an upgrade).
 
 The server binds **`0.0.0.0`** (all interfaces) and port **8314**, so it is reachable on your local network; keep it behind a trusted LAN (see the No-TLS note under Authentication).
 
@@ -164,7 +164,7 @@ The core of the API: read, write, configure, and watch GPIO pins. Every pin is a
 | `POST` | `/gpio/write/{name_or_gpio}` | Write a value to a pin |
 | `POST` | `/gpio/config/{name_or_gpio}` | Configure a pin (name, type, init, pullup, max, reversed, watched) |
 | `GET` | `/gpio/watched` | List all currently watched pins, the active webhook URL, and the `bridges` callback URLs (URLs only, never the keys) |
-| `GET` | `/gpio/scan` | Scan the usable GPIOs of the chip it runs on: classic ESP32 0, 2, 4, 5, 12-15, 18, 19, 21-23, 25-27 and 32-39 (GPIO34-39 are input-only and have no internal pull resistors); ESP32-C3 0-10, 20 and 21; ESP32-S3 0-18, 21 and 38-48. Flash, PSRAM, USB and REPL pins are excluded. Returns physical `level`, logical `value`, and the live `agent` block. |
+| `GET` | `/gpio/scan` | Scan the usable GPIOs of the chip it runs on: classic ESP32 0, 2, 4, 5, 12-15, 18, 19, 21-23, 25-27 and 32-39 (GPIO34-39 are input-only and have no internal pull resistors); ESP32-C3 0-10, 20 and 21; ESP32-S3 0-18, 21 and 38-48. Flash, PSRAM, USB and REPL pins are excluded. Returns physical `level` for every pin, logical `value` and `reversed` only for a reversed pin, and the live `agent` block. |
 
 **Status LED.** The agent pulses the board's LED to show it is running and on WiFi: GPIO2 on a classic ESP32, GPIO8 on an ESP32-C3 (active low), and the WS2812 RGB LED on GPIO48 on an ESP32-S3 (green). Reading or scanning that pin never reconfigures it, so the pulse keeps going.
 
@@ -242,7 +242,7 @@ Sensors are pure config plus on-demand reads: no pins, no background polling, no
 
 ### Configure
 
-Scripts live in the ESP32's **`scripts/` folder**. `install.sh` creates it and seeds `cpu-temp.py`; upload another script with `mpremote connect <port> fs cp weather.py :scripts/weather.py`.
+Scripts live in the ESP32's **`scripts/` folder**. `install.sh` creates it and seeds `cpu-temp.py`; upload another script with `mpremote connect <port> fs cp weather.py :scripts/weather.py`, or over the API (see [Scripts](#scripts)).
 
 The ESP32 has no shell, so a sensor script is a MicroPython `.py` file executed in-process. Its `script` value is `"<file.py> [args...]"`; the file must be a bare filename in `scripts/`. It should define `read(*args)` or set `result`. Arguments may contain letters and digits only, and results may be any JSON-serializable value.
 
@@ -253,7 +253,7 @@ curl -X POST http://<esp32-ip>:8314/sensor/config/zone1 \
   -d '{"script": "weather.py zone1"}'
 ```
 
-`scripts/` is the only folder a sensor can run code from. Paths, `..`, hidden files, and subfolders are rejected.
+`scripts/` is the only folder a sensor can run code from. Paths, `..`, hidden files, and subfolders are rejected. Once a key holder can write scripts (see [Scripts](#scripts)), they can run any code on the board: lock writes with `write.lock` when you don't need them.
 
 Reading returns a clear message instead of failing when a script is missing or broken: `{"<name>": "script not found"}`, `{"<name>": "script failed or did not produce output"}` when the script errors or its `read()`/`result` yields nothing, and `{"<name>": "blocked: <reason>"}` when a sensor violates the name/argument rules (possible when sensors arrive via `/config/load` or an edited `config.json`; every read re-validates).
 
@@ -272,6 +272,95 @@ curl -H "Api-Key: your-secret-key" http://<esp32-ip>:8314/sensor/read
 # → {"weather": {"pressure": 1013, "humidity": 62}, "probe": 21.4}
 ```
 
+## Scripts
+
+List, read, write and run the files in `scripts/`, the same folder sensors run from.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/script/list` | Every file in `scripts/`, plus whether writes are allowed |
+| `GET` | `/script/read/{name}` | One file's text |
+| `POST` | `/script/write/{name}` | Create or overwrite a file, or delete it |
+| `POST` | `/script/run/{name}` | Run a file and return its output and exit code |
+
+`{name}` is a **bare filename** of up to 32 characters: letters, digits, `.`, `_` and `-`, no leading dot or `-`, so no paths, no `..` and no subfolders (`400` otherwise). Subfolders of `scripts/` are never listed, read, written or run. A file that isn't there returns `404`.
+
+### Request Bodies
+
+#### `POST /script/write/{name}`
+
+```json
+{
+  "content": "def read(*args):\n    return 42\n"
+}
+```
+
+Or, to delete the file:
+
+```json
+{
+  "remove": true
+}
+```
+
+Writing an existing name replaces it. The new text is written to a temporary file and renamed into place, so a run never sees half a script. A script can be up to about 8 KB (the request limit).
+
+#### `POST /script/run/{name}`
+
+The body is optional:
+
+```json
+{
+  "args": ["21"]
+}
+```
+
+Arguments may contain letters and digits only.
+
+### Responses
+
+```bash
+curl -H "Api-Key: <key>" http://<esp32-ip>:8314/script/list
+# → {"scripts": [{"name": "cpu-temp.py", "size": 333, "modified": "2026-10-24 09:12:03"}], "write": "enabled"}
+
+curl -H "Api-Key: <key>" http://<esp32-ip>:8314/script/read/cpu-temp.py
+# → {"name": "cpu-temp.py", "content": "..."}
+
+curl -X POST -H "Api-Key: <key>" -H "Content-Type: application/json" \
+  -d '{"content": "result = 42"}' http://<esp32-ip>:8314/script/write/answer.py
+# → {"name": "answer.py", "size": 11}       (delete: {"name": "answer.py", "status": "removed"} or "not found")
+
+curl -X POST -H "Api-Key: <key>" http://<esp32-ip>:8314/script/run/answer.py
+# → {"name": "answer.py", "exit_code": 0, "output": "42"}
+```
+
+A run works like a sensor read: the file is exec'd in-process as MicroPython, and `output` is what its `read(*args)` returns, or its `result`, as text (a string as is, anything else as JSON; first 2 KB, trailing whitespace trimmed). `print()` goes to the USB console, not to `output`. A script that raises returns `exit_code` `1` and `"<Error>: <message>"` as `output`; otherwise `exit_code` is `0`. There is no timeout: a script that never returns stalls the agent, as a sensor would.
+
+### Write protection
+
+`list`, `read` and `run` always work. `/script/write` (including a delete) returns `403` when:
+
+- the agent's `api_key` is still the shipped default `your-secret-key` (`"write": "default_key"` in the list), so set your own key first;
+- a file named **`write.lock`** is in `scripts/` (`"write": "locked"`). Its content doesn't matter. The lock covers `write.lock` too: `/script/write` can't change or delete it.
+
+A fresh install has no lock. To lock, write the file over the API:
+
+```bash
+curl -X POST -H "Api-Key: <key>" -H "Content-Type: application/json" -d '{"content": ""}' http://<esp32-ip>:8314/script/write/write.lock
+```
+
+To unlock, remove it with the ESP32 on USB (`+ reset` restarts the agent, which `mpremote` stops):
+
+```bash
+mpremote connect <port> fs rm :scripts/write.lock + reset
+```
+
+Or run `./install.sh --unlock` in the `esp32-gpio-api` folder: it installs nothing, removes the lock from every ESP32 on USB and resets each one.
+
+The lock blocks writes over the API, not code. `/script/run` still works while locked, and a script runs inside the agent with access to the whole filesystem, so one that deletes files can remove `write.lock`. A lock keeps the folder read-only only if you trust the scripts already in it.
+
+`write.lock` shows up in `/script/list` like any other file, and running it returns `400`.
+
 ## Agent Setup
 
 Read and change the agent's own configuration, and drive process and device lifecycle (restart, upgrade, logs).
@@ -281,15 +370,15 @@ Read and change the agent's own configuration, and drive process and device life
 | `GET` | `/config/read` | Read the agent identity + full config (see response fields below) |
 | `POST` | `/config/update` | Update one or more config fields (backs up the current config first) |
 | `POST` | `/config/load` | Load a full config from a JSON dict (backs up the current config first; pass `{}` to reset) |
-| `POST` | `/upgrade` | Download and transactionally install `app.mpy`, `boot.py`, and `main.py`, then reset |
+| `POST` | `/upgrade` | Restart into `upgrader.mpy`, which downloads and transactionally installs `app.mpy`, `boot.py`, `upgrader.mpy`, and `main.py`, then starts the agent (see below) |
 | `POST` | `/restart` | Restart the device. Body is optional; pass `{"reboot": true}` to request a full hardware reset instead (see below) |
-| `GET` | `/logs` | Last 30 log lines as a JSON array (in-memory ring buffer, cleared on reboot) |
+| `GET` | `/logs` | Last 30 log lines as a JSON array (in-memory ring buffer, cleared on reboot; the boot lines say why the board last reset) |
 
 **Restart/reboot (`/restart`)**: a plain `/restart` reloads the agent in place (config, pins and watches are set up again, and Wi-Fi stays connected). `{"reboot": true}` does a full hardware reset with `machine.reset()`. Both reply first, with `{"status": "restarting"}` or `{"status": "rebooting"}`.
 
-**Self-upgrade (`/upgrade`)** downloads `app.mpy`, `boot.py`, and `main.py` from the GitHub release branch. It verifies every download before replacing anything, backs up each installed file, verifies the installed copies, and restores the previous set if installation fails. Configuration, Wi-Fi credentials, status, and sensor scripts are untouched.
+**Self-upgrade (`/upgrade`)** runs in its own boot, so the download has the memory a running agent no longer has. The agent writes `upgrade.lock`, replies `{"status": "upgrading"}` and soft-resets (Wi-Fi stays connected); `main.py` then loads `upgrader.mpy` instead of the agent. The upgrader downloads `app.mpy`, `boot.py`, `upgrader.mpy`, and `main.py` from the GitHub release branch, verifies every download before replacing anything, backs up each installed file as `<name>.backup`, verifies the installed copies, and restores the previous set if installation fails. Then it removes the lock and starts the agent, which logs the outcome once: `[UPGRADE] Done, now <version>: ...` or `[UPGRADE] Failed, still <version>: ...`. A failed attempt resets and tries again, up to 3 times; after that the board keeps the version it had. An upgrade usually takes about 10 seconds. Configuration, Wi-Fi credentials, status, and sensor scripts are untouched.
 
-The response is sent before the ESP32 resets and reconnects.
+**Upgrading from an older version:** `/upgrade` runs from `upgrader.mpy`, which older versions don't install, and a board without it answers `/upgrade` with `500`. Install once over USB with `install.sh`; `/upgrade` works from then on.
 
 ### `GET /config/read` response
 
@@ -355,6 +444,7 @@ Error responses are JSON `{"error": ...}`, except 404 which has an empty body:
 |--------|------|------|
 | `400` | Bad write/config or a request over **8 KB** | `{"error": "<reason>"}`; oversized requests return `{"error": "Bad request"}` |
 | `403` | Missing or wrong `Api-Key` header | `{"error": "Invalid or missing Api-Key header"}` |
+| `403` | `/script/write` refused (default key, or `write.lock` in place; see [Scripts](#write-protection)) | `{"error": "<reason>"}` |
 | `404` | Unknown pin/name, or unknown route | empty |
 | `422` | Malformed JSON or a missing required field | `{"error": "<reason>"}` |
 
@@ -372,17 +462,19 @@ For reversed pins the payload also includes `level` (the physical GPIO state).
 
 No webhook URL is configured by default. When a watched event occurs with **no target at all** configured (no `webhook_url` and no bridge callback), nothing is sent; the event is recorded in the agent log instead.
 
-### Https targets: ESP32 vs ESP32-S3 / C3
+### Https targets: ESP32-S3 only
 
 A TLS handshake needs roughly 35-40 KB of *contiguous* heap. A classic ESP32 has only about 24 KB of system memory free after boot, with no block over about 19 KB, so an https webhook on a classic ESP32 fails on every attempt with an out-of-memory error, in a way no amount of garbage collection fixes.
 
-As a result, **on the classic ESP32, `webhook_url` must be `http://`. An `https://` URL is rejected with a `400`, and is not stored.**
+The **ESP32-C3** has more memory, but not enough once the agent is running: its handshakes fail for lack of memory too, and a failed handshake can leave the board unresponsive until it resets.
 
-The **ESP32-S3** has the memory headroom and is unaffected: `https://` works there. The **ESP32-C3** is marginal: `https://` is accepted and usually delivers, but a handshake can still run out of memory and that delivery waits for its retry, so `http://` is recommended but not mandatory.
+As a result, **on the classic ESP32 and the ESP32-C3, `webhook_url` must be `http://`. An `https://` URL is rejected with a `400`, and is not stored.**
+
+The **ESP32-S3** has the memory headroom and is unaffected: `https://` works there.
 
 This applies to `webhook_url` only. The `bridges.homekit` / `bridges.matter` / `bridges.homebridge` callbacks are LAN targets that are already plain http, and plain http is unaffected on every chip.
 
-For the same reason, a remote `POST /upgrade` on a classic ESP32 may fail at the TLS handshake, since it downloads `app.mpy`, `boot.py` and `main.py` over https. Retry, or install over USB with `install.sh` (or copy the files with `mpremote`).
+`POST /upgrade` downloads over https too, but in its own boot without the agent loaded, which leaves a classic ESP32 the most memory it can have for the handshake. If the handshake still fails, the upgrader tries 3 times and the board keeps its current version, with the reason in `/logs`. Install over USB with `install.sh` instead (or copy the files with `mpremote`).
 
 ### Delivery and retries
 
@@ -446,7 +538,7 @@ If a dedicated `webhook_key` is configured, it is sent as the `Api-Key` header o
 
 ### Testing webhooks
 
-For development and testing, ctrlPi provides a public test endpoint: point `webhook_url` at `https://hooks.ctrlpi.com/webhook/test` and monitor the incoming events live at [https://ctrlpi.com/webhook/watch](https://ctrlpi.com/webhook/watch). The feed is public and events are retained only briefly, so use it for verification during setup, not as a production target. (On a classic ESP32 this target is unreachable - see [https targets](#https-targets-esp32-vs-esp32-s3--c3) above.)
+For development and testing, ctrlPi provides a public test endpoint: point `webhook_url` at `https://hooks.ctrlpi.com/webhook/test` and monitor the incoming events live at [https://ctrlpi.com/webhook/watch](https://ctrlpi.com/webhook/watch). The feed is public and events are retained only briefly, so use it for verification during setup, not as a production target. (On a classic ESP32 or an ESP32-C3 this target is unreachable - see [https targets](#https-targets-esp32-s3-only) above.)
 
 ### Changing the URL
 
@@ -464,15 +556,18 @@ The repository contains source, build, deployment, and device runtime files.
 
 | File | Contents |
 |------|----------|
-| `app.py` | Application source: Wi-Fi, HTTP API, GPIO, sensors, webhooks, state, and OTA upgrades |
+| `app.py` | Application source: Wi-Fi, HTTP API, GPIO, sensors, webhooks, and state |
 | `app.mpy` | Precompiled application deployed to the ESP32 |
+| `upgrader.py` | Over-the-air upgrade source, run in its own boot by `/upgrade` |
+| `upgrader.mpy` | Precompiled upgrader deployed to the ESP32 |
 | `boot.py` | Starts Wi-Fi before the application loads |
-| `main.py` | Small loader that imports `app.mpy` |
-| `build.sh` | Builds `app.mpy` with MicroPython 1.29 `mpy-cross` |
+| `main.py` | Small loader that imports `app.mpy`, or `upgrader.mpy` while `upgrade.lock` exists |
+| `build.sh` | Builds `app.mpy` and `upgrader.mpy` with MicroPython 1.29 `mpy-cross` |
 | `install.sh` | Builds when needed, collects missing settings, and deploys over USB |
 | `wifi.txt` | WiFi credentials (not committed; see `wifi.txt.example`) |
 | `config.json` | API key, pin configs, feature flags, webhook URL. Config backup is written automatically to `config-backup.json` and read on boot if `config.json` exists but fails to parse/validate |
 | `status.json` | Last known pin values, restored on boot when `init: "last"`. Inputs are recorded too, so a watched input's `init: "last"` reference has a previous reading to compare against |
+| `last-reset.txt` | Why the agent last reset itself, logged and deleted at the next boot |
 | `scripts/` | Sensor scripts; `install.sh` seeds ESP32 chip-temperature support |
 
 ## Differences from the Pi version
@@ -484,7 +579,9 @@ The repository contains source, build, deployment, and device runtime files.
 | Sensor scripts | `.sh`, run as `sh scripts/<file>` | `.py`, exec'd in-process |
 | Interactive API docs (`/docs`, `/redoc`) | Yes (`settings.docs_enabled`) | No |
 | Logs | File (`agent.log`), last 50 lines via `/logs` | In-memory ring buffer, last 30 lines via `/logs`, cleared on reboot |
-| https webhook targets | Always available | ESP32-S3 and C3 only (see [https targets](#https-targets-esp32-vs-esp32-s3--c3)) |
+| Heap watchdog | No | Resets the board when free system memory stays under 6 KB for 30 s (not in the first 3 min) |
+| Clock | System time | NTP at boot, retried every 2 min until set |
+| https webhook targets | Always available | ESP32-S3 only (see [https targets](#https-targets-esp32-s3-only)) |
 
 ## Tests
 
