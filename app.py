@@ -27,7 +27,7 @@ except ImportError:
 _FALLBACK_SSID    = const("MyNetwork")
 _FALLBACK_PASSWORD = const("MyPassword")
 _DEFAULT_API_KEY  = const("your-secret-key")
-VERSION           = "0.9.30"  # API version
+VERSION           = "0.9.31"  # API version
 _DEFAULT_LOG_DAYS = const(7)
 _PORT             = const(8314)
 _WIFI_DEAD_SECS   = const(40)      # dead-man switch: reset if WiFi stays lost this long

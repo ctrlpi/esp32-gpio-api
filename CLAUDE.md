@@ -28,8 +28,8 @@ It runs on **ESP32 hardware only**. There is no mock mode on the board: it impor
 
 ## Lockstep with `pi-gpio-api`
 
-`api-tester` runs **one REST suite against every agent**, and `mcp-bridge`, `studio-bridge`,
-`matter-bridge`, `homekit-bridge` and `homebridge-ctrlpi` treat a Pi, a Pico and an ESP32 alike. So
+`api-tester` runs **one REST suite against every agent**, and `ctrlpi-mcp`, `ctrlpi-studio`,
+`ctrlpi-matter` and `homebridge-ctrlpi` treat a Pi, a Pico and an ESP32 alike. So
 **a change to a route, a field name, a status code or a JSON shape here almost always needs the same
 change in `pi-gpio-api` and `pico-gpio-api`.** State that in the plan before writing. Divergence is
 only correct where the hardware forces it (pin tables, in-process sensor scripts, https support).
