@@ -1,7 +1,7 @@
 # ESP32 GPIO API
 
 [![Platform: ESP32](https://img.shields.io/badge/platform-ESP32-E7352C.svg)](#install-on-your-esp32)
-[![Version 0.9.31](https://img.shields.io/badge/version-0.9.31-blue.svg)](https://github.com/ctrlpi/esp32-gpio-api/tags)
+[![Version 0.9.32](https://img.shields.io/badge/version-0.9.32-blue.svg)](https://github.com/ctrlpi/esp32-gpio-api/tags)
 [![MicroPython 1.29](https://img.shields.io/badge/runtime-MicroPython%201.29-blue.svg)](#install-on-your-esp32)
 [![Auth: Api-Key](https://img.shields.io/badge/auth-Api--Key-orange.svg)](#authentication)
 [![License: MIT](https://img.shields.io/badge/license-MIT-188038.svg)](LICENSE)
@@ -9,7 +9,7 @@
 
 A MicroPython server that exposes ESP32 GPIO control through a REST API.
 
-Runs on an ESP32, ESP32-C3 or ESP32-S3 with MicroPython 1.29, API-key authentication, and `machine.Pin` GPIO.
+Runs on an ESP32, ESP32-C3, ESP32-C6 or ESP32-S3 with MicroPython 1.29, API-key authentication, and `machine.Pin` GPIO.
 
 It is the ESP32 port of [pi-gpio-api](https://github.com/ctrlpi/pi-gpio-api), with the same endpoints and wire format.
 
@@ -17,7 +17,7 @@ It is the ESP32 port of [pi-gpio-api](https://github.com/ctrlpi/pi-gpio-api), wi
 
 ## Install on your ESP32
 
-**Requirements:** MicroPython 1.29 on an ESP32, ESP32-C3 or ESP32-S3, and a Mac/PC to run Pico Bay or `install.sh` from.
+**Requirements:** MicroPython 1.29 on an ESP32, ESP32-C3, ESP32-C6 or ESP32-S3, and a Mac/PC to run Pico Bay or `install.sh` from.
 
 
 Pico Bay or `install.sh` runs on your computer: plug the ESP32 in over USB and run it.
@@ -174,9 +174,9 @@ The core of the API: read, write, configure, and watch GPIO pins. Every pin is a
 | `POST` | `/gpio/write/{name_or_gpio}` | Write a value to a pin |
 | `POST` | `/gpio/config/{name_or_gpio}` | Configure a pin (name, type, init, pullup, max, reversed, watched) |
 | `GET` | `/gpio/watched` | List all currently watched pins, the active webhook URL, and the `bridges` callback URLs (URLs only, never the keys) |
-| `GET` | `/gpio/scan` | Scan the usable GPIOs of the chip it runs on: classic ESP32 0, 2, 4, 5, 12-15, 18, 19, 21-23, 25-27 and 32-39 (GPIO34-39 are input-only and have no internal pull resistors); ESP32-C3 0-10, 20 and 21; ESP32-S3 0-18, 21 and 38-48. Flash, PSRAM, USB and REPL pins are excluded. Returns physical `level` for every pin, logical `value` and `reversed` only for a reversed pin, and the live `agent` block. |
+| `GET` | `/gpio/scan` | Scan the usable GPIOs of the chip it runs on: classic ESP32 0, 2, 4, 5, 12-15, 18, 19, 21-23, 25-27 and 32-39 (GPIO34-39 are input-only and have no internal pull resistors); ESP32-C3 0-10, 20 and 21; ESP32-C6 0-11 and 14-23; ESP32-S3 0-18, 21 and 38-48. Flash, PSRAM, USB and REPL pins are excluded. Returns physical `level` for every pin, logical `value` and `reversed` only for a reversed pin, and the live `agent` block. |
 
-**Status LED.** The agent pulses the board's LED to show it is running and on WiFi: GPIO2 on a classic ESP32, GPIO8 on an ESP32-C3 (active low), and the WS2812 RGB LED on GPIO48 on an ESP32-S3 (green). Reading or scanning that pin never reconfigures it, so the pulse keeps going.
+**Status LED.** The agent pulses the board's LED to show it is running and on WiFi: GPIO2 on a classic ESP32, GPIO8 on an ESP32-C3 (active low), GPIO15 on an ESP32-C6, and the WS2812 RGB LED on GPIO48 on an ESP32-S3 (green). Reading or scanning that pin never reconfigures it, so the pulse keeps going.
 
 ### Request Bodies
 
@@ -472,7 +472,7 @@ For reversed pins the payload also includes `level` (the physical GPIO state).
 
 No webhook URL is configured by default. When a watched event occurs with **no target at all** configured (no `webhook_url` and no bridge callback), nothing is sent; the event is recorded in the agent log instead.
 
-### Https targets: ESP32-S3 only
+### Https targets: ESP32-S3 and ESP32-C6 only
 
 A TLS handshake needs roughly 35-40 KB of *contiguous* heap. A classic ESP32 has only about 24 KB of system memory free after boot, with no block over about 19 KB, so an https webhook on a classic ESP32 fails on every attempt with an out-of-memory error, in a way no amount of garbage collection fixes.
 
@@ -480,7 +480,7 @@ The **ESP32-C3** has more memory, but not enough once the agent is running: its 
 
 As a result, **on the classic ESP32 and the ESP32-C3, `webhook_url` must be `http://`. An `https://` URL is rejected with a `400`, and is not stored.**
 
-The **ESP32-S3** has the memory headroom and is unaffected: `https://` works there.
+The **ESP32-S3** and the **ESP32-C6** have the memory headroom and are unaffected: `https://` works there.
 
 This applies to `webhook_url` only. The `bridges.homekit` / `bridges.matter` / `bridges.homebridge` callbacks are LAN targets that are already plain http, and plain http is unaffected on every chip.
 
@@ -548,7 +548,7 @@ If a dedicated `webhook_key` is configured, it is sent as the `Api-Key` header o
 
 ### Testing webhooks
 
-For development and testing, ctrlPi provides a public test endpoint: point `webhook_url` at `https://hooks.ctrlpi.com/webhook/test` and monitor the incoming events live at [https://ctrlpi.com/webhook/watch](https://ctrlpi.com/webhook/watch). The feed is public and events are retained only briefly, so use it for verification during setup, not as a production target. (On a classic ESP32 or an ESP32-C3 this target is unreachable - see [https targets](#https-targets-esp32-s3-only) above.)
+For development and testing, ctrlPi provides a public test endpoint: point `webhook_url` at `https://hooks.ctrlpi.com/webhook/test` and monitor the incoming events live at [https://ctrlpi.com/webhook/watch](https://ctrlpi.com/webhook/watch). The feed is public and events are retained only briefly, so use it for verification during setup, not as a production target. (On a classic ESP32 or an ESP32-C3 this target is unreachable - see [https targets](#https-targets-esp32-s3-and-esp32-c6-only) above.)
 
 ### Changing the URL
 
@@ -584,14 +584,14 @@ The repository contains source, build, deployment, and device runtime files.
 
 | Feature | Pi (`pi-gpio-api`) | ESP32 (`esp32-gpio-api`) |
 |---------|-----|------|
-| GPIO range | BCM 2-27 | Per chip: classic ESP32 0, 2, 4, 5, 12-15, 18, 19, 21-23, 25-27, 32-39 (34-39 input-only); C3 0-10, 20, 21; S3 0-18, 21, 38-48 |
+| GPIO range | BCM 2-27 | Per chip: classic ESP32 0, 2, 4, 5, 12-15, 18, 19, 21-23, 25-27, 32-39 (34-39 input-only); C3 0-10, 20, 21; C6 0-11, 14-23; S3 0-18, 21, 38-48 |
 | GPIO | `gpiozero` | `machine.Pin` |
 | Sensor scripts | `.sh`, run as `sh scripts/<file>` | `.py`, exec'd in-process |
 | Interactive API docs (`/docs`, `/redoc`) | Yes (`settings.docs_enabled`) | No |
 | Logs | File (`agent.log`), last 50 lines via `/logs` | In-memory ring buffer, last 30 lines via `/logs`, cleared on reboot |
 | Heap watchdog | No | Resets the board when free system memory stays under 6 KB for 30 s (not in the first 3 min) |
 | Clock | System time | NTP at boot, retried every 2 min until set |
-| https webhook targets | Always available | ESP32-S3 only (see [https targets](#https-targets-esp32-s3-only)) |
+| https webhook targets | Always available | ESP32-S3 and ESP32-C6 only (see [https targets](#https-targets-esp32-s3-and-esp32-c6-only)) |
 
 ## Tests
 

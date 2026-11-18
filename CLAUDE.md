@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this project is
 
 A standalone **MicroPython** port of `pi-gpio-api` for ESP32 boards (classic ESP32, ESP32-S3,
-ESP32-C3): the same REST API, the same wire format, the same behaviour, written against MicroPython
+ESP32-C3, ESP32-C6): the same REST API, the same wire format, the same behaviour, written against MicroPython
 1.29 instead of FastAPI. A sibling of `pico-gpio-api`, from which it was ported.
 
 It runs on **ESP32 hardware only**. There is no mock mode on the board: it imports `machine`,
@@ -45,7 +45,7 @@ only correct where the hardware forces it (pin tables, in-process sensor scripts
 |---|---|
 | Constants | `VERSION`, `_PORT` 8314, Wi-Fi/webhook timers, `UPGRADE_BASE_URL` + `UPGRADE_FILES` |
 | Chip + pin tables | `PLATFORM` (from `os.uname().machine`), then `RESERVED_PINS` / `GPIO_PINS` / `INPUT_ONLY_PINS` per chip, `_validate_gpio()` |
-| `_detect_default_led()` | Status LED per chip: C3 GPIO8 (active-low), S3 GPIO48 (WS2812 RGB), classic GPIO2 |
+| `_detect_default_led()` | Status LED per chip: C3 GPIO8 (active-low), C6 GPIO15 (the Super Mini's plain LED; its RGB is on GPIO8), S3 GPIO48 (WS2812 RGB), classic GPIO2 |
 | `_normalize_config()` | The single place root aliases fold into their groups |
 | Validators | `_norm_init`, `_is_script_name`, `_sensor_script_parts` |
 | `Blinker` | Status LED, driven by `machine.Timer(0)`; on the S3 it writes `LED_RGB_COLOR` (dim green) through `neopixel` instead of a pin level |
@@ -61,13 +61,14 @@ only correct where the hardware forces it (pin tables, in-process sensor scripts
 
 `GPIO_PINS` is the only list `_validate_gpio()` accepts; anything else answers
 `400 "GPIO<n> is unavailable or reserved on this ESP32"`. The chip is picked from
-`os.uname().machine` (`"...ESP32-S3"`, `"...ESP32-C3"`, otherwise classic):
+`os.uname().machine` (`"...ESP32-S3"`, `"...ESP32-C3"`, `"...ESP32-C6"`, otherwise classic):
 
 | Chip | Kept out (`RESERVED_PINS`) | Notes |
 |---|---|---|
 | Classic ESP32 | 1, 3 (UART0 REPL), 6-11 (SPI flash), 16, 17 (PSRAM) | 34-39 are input-only, no pulls. The firmware itself accepts 6-11 (verified on a DevKit V1), so this table is the only guard |
 | ESP32-S3 | 19, 20 (native USB), 26-32 (flash/PSRAM), 33-37 (octal flash/PSRAM) | 22-25 do not exist; 43/44 (UART0) allowed |
 | ESP32-C3 | 11 (VDD_SPI), 12-17 (flash), 18, 19 (native USB, the REPL) | 0-10, 20, 21 only |
+| ESP32-C6 | 12, 13 (native USB, the REPL), 24-30 (flash) | 0-11, 14-23 only; 16/17 (UART0) allowed. Not on a tester rig yet |
 
 On the S3 and C3 the UART0 pins are deliberately usable, because the tester rigs use them. Taking one
 detaches a UART REPL until reset, and on a board with a USB-UART bridge the bridge holds both lines
@@ -182,7 +183,8 @@ per read; `ip`, `signal`, `cpu_temperature` and `uptime` stay live (`TestAgentBl
   `/script/write` can't lift it; USB can (`./install.sh --unlock`), and so can a script run through
   `/script/run`, since runs still work while locked (api-tester test 59 unlocks that way). `write.lock` in any case is never run. The `test_script_*`
   tests cover it.
-- **https webhooks: S3 only** (`HTTPS_WEBHOOK_OK`, `_IS_S3`). A TLS handshake needs roughly 35 KB
+- **https webhooks: S3 and C6 only** (`HTTPS_WEBHOOK_OK`, `_HTTPS_CHIP`). The C6 was measured
+  with the agent loaded: largest free block about 184 KB, 5 of 5 https requests worked. A TLS handshake needs roughly 35 KB
   of contiguous system RAM; a classic ESP32 has about 24 KB free after boot (largest block ~19 KB),
   and every https POST failed with `OSError(12)` (ENOMEM) on the test rig. The C3 was marginal and
   then failed outright with the agent loaded (`MPI_ALLOC_FAILED`, `X509_ALLOC_FAILED`, even right

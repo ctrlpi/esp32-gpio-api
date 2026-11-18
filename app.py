@@ -27,7 +27,7 @@ except ImportError:
 _FALLBACK_SSID    = const("MyNetwork")
 _FALLBACK_PASSWORD = const("MyPassword")
 _DEFAULT_API_KEY  = const("your-secret-key")
-VERSION           = "0.9.31"  # API version
+VERSION           = "0.9.32"  # API version
 _DEFAULT_LOG_DAYS = const(7)
 _PORT             = const(8314)
 _WIFI_DEAD_SECS   = const(40)      # dead-man switch: reset if WiFi stays lost this long
@@ -90,6 +90,13 @@ elif "c3" in _CHIP:
 	RESERVED_PINS   = (11, 12, 13, 14, 15, 16, 17, 18, 19)
 	GPIO_PINS       = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 21)
 	INPUT_ONLY_PINS = ()
+elif "c6" in _CHIP:
+	# 12/13 native USB (the REPL), 24-30 SPI flash.
+	# UART0 (16/17) stays usable: taking it detaches a UART REPL until reset.
+	RESERVED_PINS   = (12, 13, 24, 25, 26, 27, 28, 29, 30)
+	GPIO_PINS       = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19,
+	                   20, 21, 22, 23)
+	INPUT_ONLY_PINS = ()
 else:
 	# 1/3 UART0 REPL, 6-11 SPI flash, 16/17 PSRAM on WROVER modules.
 	RESERVED_PINS   = (1, 3, 6, 7, 8, 9, 10, 11, 16, 17)
@@ -111,9 +118,11 @@ def _validate_gpio(gpio, conf=None):
 
 # The status LED for this chip: (pin, active_low, is_rgb).
 def _detect_default_led():
-	m = (PLATFORM or "").lower()
+	m = _CHIP
 	if "c3" in m:
 		return 8, True, False   # ESP32-C3: GPIO 8 (active-low on SuperMini/LuatOS)
+	elif "c6" in m:
+		return 15, False, False # ESP32-C6: GPIO 15 (the plain LED on the Super Mini; its RGB is on 8)
 	elif "s3" in m:
 		return 48, False, True  # ESP32-S3: GPIO 48 (WS2812 RGB on DevKitC-1 style boards)
 	else:
@@ -128,10 +137,11 @@ _LED_TIMER_ID           = const(0)
 # ~19 KB), so every https POST fails with ENOMEM. An ESP32-C3 with the agent loaded failed
 # the same way (MPI_ALLOC_FAILED, X509_ALLOC_FAILED, even right after boot), and its failed
 # handshakes hung the board. Like the original Pico W, both refuse https URLs instead of
-# storing one that never delivers; only the S3 has the room.
-_IS_S3              = "s3" in _CHIP
-HTTPS_WEBHOOK_OK    = _HAS_SSL and _IS_S3
-HTTPS_WEBHOOK_ERROR = ("https webhooks need the ssl module" if _IS_S3 else
+# storing one that never delivers. The S3 and the C6 have the room (a C6 with the
+# agent loaded keeps a largest free block of about 184 KB, and its https POSTs work).
+_HTTPS_CHIP         = "s3" in _CHIP or "c6" in _CHIP
+HTTPS_WEBHOOK_OK    = _HAS_SSL and _HTTPS_CHIP
+HTTPS_WEBHOOK_ERROR = ("https webhooks need the ssl module" if _HTTPS_CHIP else
                        "https webhooks are not supported on an ESP32-C3: use http://" if "c3" in _CHIP else
                        "https webhooks are not supported on a classic ESP32: use http://")
 

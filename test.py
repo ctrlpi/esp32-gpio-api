@@ -1298,7 +1298,7 @@ class TestWebhookSender(unittest.TestCase):
 
 
 class TestHttpsByChip(unittest.TestCase):
-    """Only the S3 takes https webhook URLs; the classic and the C3 refuse them, each by name."""
+    """The S3 and the C6 take https webhook URLs; the classic and the C3 refuse them, each by name."""
 
     @staticmethod
     def load(chip):
@@ -1313,7 +1313,7 @@ class TestHttpsByChip(unittest.TestCase):
         return app
 
     def test_s3_only(self):
-        """https on the S3; a 400 message naming the board on the classic and the C3"""
+        """https on the S3 and the C6; a 400 message naming the board on the classic and the C3"""
         s3 = self.load("generic esp32s3 module with esp32-s3")
         self.assertTrue(s3["HTTPS_WEBHOOK_OK"])
         c3 = self.load("esp32c3 module with esp32-c3")
@@ -1322,6 +1322,19 @@ class TestHttpsByChip(unittest.TestCase):
         classic = self.load("generic esp32 module with esp32")
         self.assertFalse(classic["HTTPS_WEBHOOK_OK"])
         self.assertIn("classic ESP32", classic["HTTPS_WEBHOOK_ERROR"])
+        c6 = self.load("esp32c6 module with esp32-c6")
+        self.assertTrue(c6["HTTPS_WEBHOOK_OK"])
+
+    def test_c6_pins_and_led(self):
+        """The C6 keeps its native USB (12, 13) and flash (24-30) pins out, and blinks GPIO 15"""
+        c6 = self.load("esp32c6 module with esp32-c6")
+        for pin in (12, 13, 24, 25, 26, 27, 28, 29, 30):
+            self.assertNotIn(pin, c6["GPIO_PINS"])
+            self.assertIn(pin, c6["RESERVED_PINS"])
+        for pin in (0, 8, 9, 15, 16, 17, 23):
+            self.assertIn(pin, c6["GPIO_PINS"])
+        self.assertEqual(c6["_detect_default_led"](), (15, False, False))
+        self.assertEqual(self.load("esp32c3 module with esp32-c3")["_detect_default_led"](), (8, True, False))
 
 
 class TestNtpRetry(unittest.TestCase):
