@@ -273,6 +273,108 @@ class TestEsp32GpioApi(unittest.TestCase):
         self.assertFalse(res.json()["notifications"].get("webhook"))
         self.post("/config/update", headers=self.headers, json={"webhook_url": ""})
 
+    def _cfg(self, pin, body):
+        return self.post(f"/gpio/config/{pin}", headers=self.headers, json=body)
+
+    def _wait_for_script_file(self, name, text, timeout=5):
+        """Waits until scripts/<name> holds `text` (a pin script runs from the main loop)"""
+        deadline = time.time() + timeout
+        content = None
+        while time.time() < deadline:
+            r = self._script("read", name)
+            if r.status_code == 200:
+                content = r.json()["content"]
+                if content == text:
+                    return content
+            time.sleep(0.1)
+        return content
+
+    def test_pin_script_config_and_validation(self):
+        """A pin's script is set, stored canonical, read back, cleared, and refused when it is not a plain filename"""
+        pin = lambda n: self.get(f"/gpio/read/{n}", headers=self.headers).json()
+        try:
+            r = self._cfg(4, {"type": "output", "script": "On:  relay.py   fast"})
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(r.json()["script"], "on:relay.py fast")
+            self.assertEqual(pin(4)["script"], "on:relay.py fast")
+            gpios = self.get("/config/read", headers=self.headers).json()["gpios"]
+            self.assertEqual(gpios["4"]["script"], "on:relay.py fast")
+            self.assertEqual(self._cfg(4, {"script": "OFF: relay.py"}).json()["script"], "off:relay.py")
+            self.assertEqual(self._cfg(4, {"script": "relay.py"}).json()["script"], "relay.py")
+            self.assertEqual(self._cfg(5, {"type": "input", "script": "on: relay.py"}).json()["script"], "on:relay.py")
+            self.assertEqual(self._cfg(5, {"script": 5}).json()["script"], "5")
+            for bad in ("../x.py", "sub/x.py", ".hidden", "relay.py a-b", "on:", "off: ", "a" * 33, "-x.py"):
+                r = self._cfg(4, {"script": bad})
+                self.assertEqual(r.status_code, 400, bad)
+                self.assertEqual(pin(4)["script"], "relay.py", bad)
+            for empty in ("", None):
+                self._cfg(4, {"script": "relay.py"})
+                self.assertNotIn("script", self._cfg(4, {"script": empty}).json())
+                self.assertNotIn("script", pin(4))
+            self._cfg(4, {"script": "relay.py"})
+            self.assertNotIn("script", self._cfg(4, {"type": "vcc"}).json())
+            body = {"gpios": {"13": {"type": "output", "script": "ON: relay.py"},
+                              "14": {"type": "output", "script": "../bad.py"}}}
+            self.assertEqual(self.post("/config/load", headers=self.headers, json=body).status_code, 200)
+            gpios = self.get("/config/read", headers=self.headers).json()["gpios"]
+            self.assertEqual(gpios["13"]["script"], "on:relay.py")
+            self.assertNotIn("script", gpios["14"])
+        finally:
+            self.post("/config/load", headers=self.headers, json={})
+
+    def test_pin_script_runs_on_output_changes(self):
+        """An output's script runs when its value really changes: both ways with the value as the argument, or only on / off with none"""
+        marker, script = "test_ci_pin.log", "test_ci_pin.py"
+        src = ("def read(*args):\n"
+               "    with open('scripts/" + marker + "', 'a') as f:\n"
+               "        f.write(str(len(args)) + ' ' + ' '.join(args) + '\\n')\n")
+        write = lambda v: self.assertEqual(self.post("/gpio/write/4", headers=self.headers, json={"value": v}).status_code, 200)
+        reset = lambda: self.assertEqual(self._script("write", marker, {"content": ""}).status_code, 200)
+        def arm(value):
+            self._cfg(4, {"script": ""})
+            reset()
+            self.assertEqual(self._cfg(4, {"script": value}).status_code, 200)
+        try:
+            self.assertEqual(self._script("write", script, {"content": src}).status_code, 200)
+            self._cfg(4, {"type": "output"})
+            arm(script)
+            write(1); write(1); write(0)
+            self.assertEqual(self._wait_for_script_file(marker, "1 1\n1 0\n"), "1 1\n1 0\n")
+            arm(script + " fast")
+            write(1)
+            self.assertEqual(self._wait_for_script_file(marker, "2 fast 1\n"), "2 fast 1\n")
+            arm("on:" + script)
+            write(0); write(1); write(0); write(1)
+            self.assertEqual(self._wait_for_script_file(marker, "0 \n0 \n"), "0 \n0 \n")
+            arm("off: " + script)
+            write(1); write(0)
+            self.assertEqual(self._wait_for_script_file(marker, "0 \n"), "0 \n")
+            self._cfg(4, {"script": ""})
+            reset()
+            write(1); write(0)
+            time.sleep(0.5)
+            self.assertEqual(self._script("read", marker).json()["content"], "")
+        finally:
+            self._cfg(4, {"type": "remove"})
+            for n in (script, marker):
+                self._script("write", n, {"remove": True})
+
+    def test_pin_script_missing_file_is_skipped(self):
+        """A pin script whose file does not exist is accepted, and a change just logs a skip"""
+        try:
+            r = self._cfg(4, {"type": "output", "init": 0, "script": "test_ci_no_such_script.py"})
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(self.post("/gpio/write/4", headers=self.headers, json={"value": 1}).status_code, 200)
+            deadline = time.time() + 5
+            logs = ""
+            while time.time() < deadline and "skipped test_ci_no_such_script.py 1" not in logs:
+                time.sleep(0.1)
+                logs = json.dumps(self.get("/logs", headers=self.headers).json())
+            self.assertIn("skipped test_ci_no_such_script.py 1", logs)
+            self.assertEqual(self.get("/gpio/read/4", headers=self.headers).json()["value"], 1)
+        finally:
+            self._cfg(4, {"type": "remove"})
+
     def test_config_load(self):
         """POST /config/load loads bulk JSON configuration"""
         payload = {
@@ -1387,6 +1489,152 @@ class TestNtpRetry(unittest.TestCase):
         self.assertEqual(self.clock[0] - self.app["_BOOT_TIME"], 600)
         self.assertEqual(self.lines, ["[BOOT] Clock set over NTP"])
         self.assertEqual(self.app["_format_uptime"](self.clock[0] - self.app["_BOOT_TIME"]), "10m")
+
+
+class TestPinScripts(unittest.TestCase):
+    """Pin script triggers, in-process on the mocked machine: an input edge is simulated through the
+    pin's irq handler, and the queue the main loop drains is read directly."""
+
+    @classmethod
+    def setUpClass(cls):
+        repo_dir = os.path.dirname(os.path.abspath(__file__))
+        sys.path[:0] = [os.path.join(repo_dir, 'test_mocks'), repo_dir]
+        with open(os.path.join(repo_dir, 'app.py')) as f:
+            src = f.read().replace('\nmain()\n', '\n')
+        cls.app = {'__name__': 'app_under_test'}
+        exec(compile(src, 'app.py', 'exec'), cls.app)
+
+    def setUp(self):
+        self.board = tempfile.mkdtemp(prefix="pin_scripts_")
+        self.addCleanup(shutil.rmtree, self.board, True)
+        cwd = os.getcwd()
+        os.chdir(self.board)
+        self.addCleanup(os.chdir, cwd)
+        with open("config.json", "w") as f:
+            json.dump({"api_key": "k", "name": "t"}, f)
+        self.app["machine"].Pin._pins.clear()
+        self.manager = self.app["GPIOManager"]()
+
+    def cfg(self, gpio, **update):
+        return self.manager.config_pin(str(gpio), update)
+
+    def edge(self, gpio, level):
+        pin = self.manager.pins[str(gpio)]
+        pin.value(level)
+        pin.irq_handler(pin)
+
+    def test_output_runs_on_a_real_change_only(self):
+        self.cfg(4, type="output", init=0, script="relay.py")
+        for v in (1, 1, 0):
+            self.manager.write_pin("4", v)
+        self.assertEqual(self.manager._script_queue, [("4", "relay.py", ["1"]), ("4", "relay.py", ["0"])])
+
+    def test_on_and_off_prefixes_run_one_way_and_send_no_value(self):
+        self.cfg(4, type="output", init=0, script="on: relay.py fast")
+        self.manager.write_pin("4", 1)
+        self.manager.write_pin("4", 0)
+        self.assertEqual(self.manager._script_queue, [("4", "relay.py", ["fast"])])
+        self.manager._script_queue.clear()
+        self.cfg(4, script="off:relay.py")
+        self.manager.write_pin("4", 1)
+        self.manager.write_pin("4", 0)
+        self.assertEqual(self.manager._script_queue, [("4", "relay.py", [])])
+
+    def test_duration_revert_queues_the_script(self):
+        self.cfg(4, type="output", init=0, script="relay.py")
+        self.manager.write_pin("4", 1, 0.2)
+        time.sleep(0.4)
+        self.manager.process_reverts()
+        self.assertEqual(self.manager._script_queue, [("4", "relay.py", ["1"]), ("4", "relay.py", ["0"])])
+
+    def test_output_at_boot_starts_from_what_the_agent_knows(self):
+        q = self.manager._script_queue
+        self.cfg(5, type="output", init=1, script="on:relay.py")   # powers on LOW: init 1 is a change to on
+        self.assertEqual(q, [("5", "relay.py", [])])
+        q.clear()
+        self.manager.status["13"] = 1                               # init "last" restores the saved 1: no change
+        self.cfg(13, type="output", init="last", script="on:relay.py")
+        self.assertEqual(self.manager.get_pin_info("13")["value"], 1)
+        self.assertEqual(q, [])
+        self.cfg(14, type="output", init="last", script="on:relay.py")   # nothing saved: starts at 0
+        self.assertEqual(q, [])
+        self.manager.write_pin("14", 1)
+        self.assertEqual(q, [("14", "relay.py", [])])
+
+    def test_input_edge_queues_the_script_without_a_watch(self):
+        self.cfg(18, type="input", script="relay.py")
+        self.assertFalse(self.manager.watches.get("18"))
+        self.assertIsNotNone(self.manager.pins["18"].irq_handler)   # edges are heard for the script alone
+        self.assertEqual(self.manager._script_queue, [])
+        hooks = []
+        self.manager._trigger_webhook = lambda gpio: hooks.append(gpio)
+        self.edge(18, 1)
+        self.manager._last_watch_ms.clear()
+        self.edge(18, 0)
+        self.assertEqual(self.manager._script_queue, [("18", "relay.py", ["1"]), ("18", "relay.py", ["0"])])
+        self.assertEqual(hooks, [])                                 # no watch: no webhook
+
+    def test_input_is_compared_with_its_init_at_boot(self):
+        self.cfg(19, type="input", init=1, script="on:relay.py")    # idle reads 0, init says 1
+        self.assertEqual(self.manager._script_queue, [])            # a change to 0 is not an "on"
+        self.cfg(23, type="input", init=0, script="relay.py")       # as expected: nothing
+        self.assertEqual(self.manager._script_queue, [])
+        self.cfg(25, type="input", init=1, script="off:relay.py")   # idle 0 against init 1: a change to off
+        self.assertEqual(self.manager._script_queue, [("25", "relay.py", [])])
+
+    def test_a_script_set_later_is_measured_from_the_current_value(self):
+        self.cfg(18, type="input")
+        self.manager.pins["18"].value(1)           # the pin changed while it had no script
+        self.cfg(18, script="relay.py")
+        self.assertEqual(self.manager._script_queue, [])   # setting the script runs nothing
+        self.edge(18, 0)                           # a real edge afterwards does
+        self.assertEqual(self.manager._script_queue, [("18", "relay.py", ["0"])])
+
+    def test_setting_a_script_with_reversed_is_not_run_by_the_setup(self):
+        self.cfg(4, type="output", init=0)
+        self.manager.write_pin("4", 0)
+        self.cfg(4, reversed=True, script="relay.py")   # the pin is set up again with the new reversed
+        self.assertEqual(self.manager._script_queue, [])
+
+    def test_a_debounced_edge_is_read_again(self):
+        self.cfg(18, type="input", script="relay.py")
+        ran = []
+        self.manager.run_script = lambda name, body: ran.append(body["args"]) or {"exit_code": 0}
+        self.edge(18, 1)                                            # goes to 1: queued
+        self.edge(18, 0)                                            # back to 0 inside the debounce window: dropped now
+        self.assertEqual(len(self.manager._script_queue), 1)
+        time.sleep(0.4)                                             # and read again after it
+        self.manager.process_scripts()
+        self.manager.process_scripts()
+        self.assertEqual(ran, [["1"], ["0"]])
+
+    def test_queue_is_capped_and_runs_one_per_call(self):
+        self.cfg(4, type="output", init=0, script="relay.py")
+        for i in range(12):
+            self.manager.write_pin("4", (i + 1) % 2)
+        self.assertEqual(len(self.manager._script_queue), self.app["_SCRIPT_QUEUE_MAX"])
+        ran = []
+        self.manager.run_script = lambda name, body: ran.append(body["args"]) or {"exit_code": 0}
+        self.manager.process_scripts()
+        self.assertEqual(len(ran), 1)
+        self.assertEqual(len(self.manager._script_queue), self.app["_SCRIPT_QUEUE_MAX"] - 1)
+
+    def test_a_missing_script_is_skipped_and_logged(self):
+        self.cfg(4, type="output", init=0, script="no_such_script.py")
+        self.manager.write_pin("4", 1)
+        self.manager.process_scripts()
+        self.assertEqual(self.manager._script_queue, [])
+        self.assertTrue(any("skipped no_such_script.py 1" in line for line in self.manager.get_logs()))
+
+    def test_config_is_validated_and_stored_canonical(self):
+        self.assertEqual(self.cfg(4, type="output", script="On:  relay.py  fast")["script"], "on:relay.py fast")
+        for bad in ("../x.py", "x/y.py", ".h.py", "r.py a-b", "on:", "a" * 33, "-x.py"):
+            with self.assertRaises(ValueError, msg=bad):
+                self.cfg(4, script=bad)
+        self.assertEqual(self.manager.get_pin_info("4")["script"], "on:relay.py fast")
+        self.assertNotIn("script", self.cfg(4, script=""))
+        self.assertEqual(self.cfg(4, script=7)["script"], "7")
+        self.assertNotIn("script", self.cfg(4, type="gnd"))
 
 
 if __name__ == "__main__":
